@@ -1,0 +1,10 @@
+{
+    "auto_filtering": [],
+    "filter_warnings": {},
+    "warnings_enabled": false,
+    "warnings_threshold": 3,
+    "warnings_action": "timeout",
+    "timeout_duration": 10,
+    "logging_enabled": false,
+    "log_channel_id": null
+}
