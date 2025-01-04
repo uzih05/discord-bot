@@ -11,7 +11,6 @@ from discord import app_commands, Interaction
 from utils import is_not_dm
 from discord.ext import commands
 
-
 logger = logging.getLogger(__name__)
 
 # 상수 정의

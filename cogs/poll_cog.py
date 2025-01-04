@@ -20,6 +20,7 @@ from utils.poll_manager import PollManager
 
 logger = logging.getLogger(__name__)
 
+
 def parse_duration(duration_str: str) -> int:
     """
     지속 시간 문자열을 파싱해 총 '분' 단위로 반환.

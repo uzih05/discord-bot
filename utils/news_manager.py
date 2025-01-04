@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+
 class NewsManager:
     def __init__(self, news_dir: str):
         self.news_dir = news_dir

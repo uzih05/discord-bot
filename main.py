@@ -12,40 +12,26 @@ from discord import Interaction, app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-# 로깅 설정
-LOG_DIR = "logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-
 logger = logging.getLogger(__name__)
-
-# 로깅 레벨을 환경 변수로 설정 (기본값 ERROR)
-LOG_LEVEL = "ERROR"
-
-logger.setLevel(getattr(logging, LOG_LEVEL))
+logging.basicConfig(level=logging.ERROR)
 
 # 기존 핸들러 제거
 for handler in logger.handlers[:]:
     logger.removeHandler(handler)
 
-# 핸들러 생성
-file_handler = logging.FileHandler(filename=os.path.join(LOG_DIR, 'bot.log'), encoding='utf-8', mode='a')
+# 콘솔 핸들러 생성
 stream_handler = logging.StreamHandler()
 
 # 포매터 설정
-file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 console_formatter = logging.Formatter('%(levelname)s: %(message)s')  # 간단한 포맷
 
-file_handler.setFormatter(file_formatter)
 stream_handler.setFormatter(console_formatter)
 
-# 핸들러 추가
-logger.addHandler(file_handler)
+# 콘솔 핸들러 추가
 logger.addHandler(stream_handler)
 
 # propagate 설정 (중복 로깅 방지)
 logger.propagate = False
-
-logger.info(f"로깅 레벨이 {LOG_LEVEL}로 설정되었습니다.")
 
 # .env 파일에서 환경 변수 로드
 ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
@@ -82,28 +68,23 @@ class MyBot(commands.Bot):
                     try:
                         await self.load_extension(extension)
                         self._loaded_cogs.add(extension)
-                        logger.info(f'{extension} 로드 완료.')
                     except Exception as e:
                         logger.error(f'{extension} 로드 중 오류 발생: {e}')
 
         # 슬래시 명령어 동기화
         try:
             await self.tree.sync()
-            logger.info("슬래시 명령어 동기화 완료!")
         except Exception as e:
             logger.error(f"슬래시 명령어 동기화 중 오류: {e}")
 
     async def on_ready(self):
-        logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
         activity = discord.Game(name="/도움말")
         await self.change_presence(status=discord.Status.online, activity=activity)
-        logger.info("봇이 준비되었습니다!")
 
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
         await super().close()
-        logger.info("봇이 안전하게 종료되었습니다.")
 
 # 봇 객체 생성
 bot = MyBot()
@@ -240,8 +221,6 @@ async def main():
     try:
         async with bot:
             await bot.start(DISCORD_TOKEN)
-    except asyncio.CancelledError:
-        logger.info("Bot is shutting down gracefully...")
     except Exception as e:
         logger.error(f"봇 실행 중 예기치 않은 오류 발생: {e}")
 
@@ -249,10 +228,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt detected. Shutting down...")
-    except asyncio.CancelledError:
-        logger.info("Asyncio task was cancelled. Gracefully exiting...")
+        pass
     except Exception as e:
         logger.error(f"프로그램 실행 중 예기치 않은 오류 발생: {e}")
-    finally:
-        logger.info("프로그램 종료 완료.")
