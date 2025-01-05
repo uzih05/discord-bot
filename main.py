@@ -13,7 +13,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.INFO)
 
 # 기존 핸들러 제거
 for handler in logger.handlers[:]:

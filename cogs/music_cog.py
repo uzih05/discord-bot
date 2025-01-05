@@ -1,9 +1,10 @@
-# Part 1: Imports and Base Classes
 import asyncio
 import hashlib
 import logging
 import os
 import random
+import json
+
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, List, Tuple, Any, Union
@@ -19,7 +20,11 @@ from discord.ext import commands, tasks
 from discord.ui import Button, View
 from asyncio import Lock, TimeoutError as AsyncTimeoutError
 
-# Set up logging
+# Set up logging with more detailed format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
@@ -33,18 +38,25 @@ class SongData:
     is_downloading: bool = False
     download_future: Optional[asyncio.Future] = None
     added_at: datetime = datetime.now()
+    download_retries: int = 0  # Added retry counter
+    max_retries: int = 3      # Maximum retry attempts
 
     @property
     def is_expired(self) -> bool:
         """Check if song cache has expired (older than 1 hour)"""
         return (datetime.now() - self.added_at) > timedelta(hours=1)
 
-# Constants for configuration
-CACHE_CLEANUP_INTERVAL = 3600  # 1 hour in seconds
-DOWNLOAD_TIMEOUT = 300  # Increased to 5 minutes
-VOICE_TIMEOUT = 600  # Increased to 10 minutes
+    def should_retry(self) -> bool:
+        """Check if download should be retried"""
+        return self.download_retries < self.max_retries
+
+# Constants with improved configuration
+CACHE_CLEANUP_INTERVAL = 1800  # Reduced to 30 minutes
+DOWNLOAD_TIMEOUT = 180        # Reduced to 3 minutes
+VOICE_TIMEOUT = 300          # Reduced to 5 minutes
 MAX_RETRIES = 3
 DEFAULT_VOLUME = 0.05
+MAX_QUEUE_SIZE = 1000       # Added queue size limit
 
 # Exception classes
 class MusicBotError(Exception):
@@ -59,7 +71,7 @@ class VoiceConnectionError(MusicBotError):
     """Raised when voice connection fails"""
     pass
 
-# YT-DLP configuration
+# YT-DLP configuration with improved options
 ytdlp_format_options = {
     'format': 'bestaudio/best',
     'restrictfilenames': True,
@@ -77,43 +89,173 @@ ytdlp_format_options = {
         'preferredcodec': 'opus',
         'preferredquality': '192',
     }],
+    'socket_timeout': 10,     # Added timeout
+    'retries': 3,            # Added retries
 }
 
-# FFmpeg configuration
+# FFmpeg configuration with improved options
 ffmpeg_options = {
-    'options': '-vn -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0'
+    'options': '-vn -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0 -thread_queue_size 4096'
 }
 
-# Thread pool for downloads
-download_executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="music_downloader")
+# Optimized thread pool
+download_executor = ThreadPoolExecutor(
+    max_workers=5,  # Reduced max workers
+    thread_name_prefix="music_downloader"
+)
 
-
-# Part 2: Utility Functions
 
 class VoiceConnectionPool:
     def __init__(self):
         self.connections = {}
         self.lock = asyncio.Lock()
+        self.reconnect_attempts = {}
+        self.max_reconnect_attempts = 3
 
     async def get_connection(self, channel: discord.VoiceChannel) -> discord.VoiceClient:
         async with self.lock:
-            if channel.guild.id in self.connections:
-                connection = self.connections[channel.guild.id]
+            guild_id = channel.guild.id
+
+            if guild_id in self.connections:
+                connection = self.connections[guild_id]
                 if connection.is_connected():
                     if connection.channel.id != channel.id:
                         await connection.move_to(channel)
                     return connection
+                else:
+                    # Handle disconnected state
+                    await self.handle_disconnected_connection(guild_id, channel)
 
-            connection = await channel.connect()
-            self.connections[channel.guild.id] = connection
-            return connection
+            # Create new connection
+            try:
+                connection = await channel.connect(timeout=10.0, reconnect=True)
+                self.connections[guild_id] = connection
+                self.reconnect_attempts[guild_id] = 0
+                return connection
+            except Exception as e:
+                logger.error(f"Failed to create voice connection: {e}")
+                raise
+
+    async def handle_disconnected_connection(self, guild_id: int, channel: discord.VoiceChannel):
+        """Handle disconnected voice connection with retry logic"""
+        if guild_id in self.reconnect_attempts:
+            if self.reconnect_attempts[guild_id] >= self.max_reconnect_attempts:
+                del self.connections[guild_id]
+                del self.reconnect_attempts[guild_id]
+                raise VoiceConnectionError("Max reconnection attempts reached")
+
+            self.reconnect_attempts[guild_id] += 1
+        else:
+            self.reconnect_attempts[guild_id] = 1
+
+        try:
+            await self.connections[guild_id].disconnect()
+        except:
+            pass
+
+        del self.connections[guild_id]
 
     async def disconnect(self, guild_id: int):
+        """Safely disconnect and cleanup connection"""
         if guild_id in self.connections:
             try:
-                await self.connections[guild_id].disconnect()
+                connection = self.connections[guild_id]
+                if connection.is_connected():
+                    await connection.disconnect()
+            except Exception as e:
+                logger.error(f"Error disconnecting: {e}")
             finally:
                 self.connections.pop(guild_id, None)
+                self.reconnect_attempts.pop(guild_id, None)
+
+
+class CacheManager:
+    def __init__(self):
+        self.cache: Dict[str, SongData] = {}
+        self.lock = Lock()
+        self._cleanup_task = None
+        self.download_queue = DownloadQueue()
+        self._last_cleanup = datetime.now()
+        self.max_cache_size = 100  # Maximum number of songs in cache
+
+    async def get(self, song_id: str) -> Optional[SongData]:
+        """Get a song from cache."""
+        async with self.lock:
+            return self.cache.get(song_id)
+
+    async def set(self, song_id: str, song_data: SongData) -> None:
+        """Add or update a song in cache with size limit."""
+        async with self.lock:
+            if song_id not in self.cache and len(self.cache) >= self.max_cache_size:
+                # Remove oldest entry if cache is full
+                oldest_id = min(self.cache.items(), key=lambda x: x[1].added_at)[0]
+                await self.remove(oldest_id)
+            self.cache[song_id] = song_data
+
+    async def remove(self, song_id: str) -> None:
+        """Remove a song from cache and clean up its files."""
+        async with self.lock:
+            if song_id in self.cache:
+                song_entry = self.cache[song_id]
+                if song_entry.file_path and os.path.exists(song_entry.file_path):
+                    try:
+                        os.remove(song_entry.file_path)
+                        logger.debug(f"Deleted file: {song_entry.file_path}")
+                    except OSError as e:
+                        logger.error(f"Failed to delete file: {e}")
+                self.cache.pop(song_id)
+
+    async def periodic_cleanup(self):
+        """Periodic cleanup with improved logic"""
+        while True:
+            try:
+                await asyncio.sleep(CACHE_CLEANUP_INTERVAL)
+                async with self.lock:
+                    current_time = datetime.now()
+                    # Only clean if sufficient time has passed
+                    if (current_time - self._last_cleanup).total_seconds() >= CACHE_CLEANUP_INTERVAL:
+                        await self.cleanup_expired()
+                        self._last_cleanup = current_time
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Periodic cleanup error: {e}")
+                await asyncio.sleep(60)  # Wait before retrying
+
+    def start_cleanup_task(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start the periodic cleanup task with error handling"""
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+
+        self._cleanup_task = loop.create_task(self.periodic_cleanup())
+        self._cleanup_task.add_done_callback(self._cleanup_task_done_callback)
+
+    def _cleanup_task_done_callback(self, future: asyncio.Future):
+        """Handle cleanup task completion"""
+        try:
+            future.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Cleanup task error: {e}")
+
+    async def cleanup_expired(self) -> None:
+        """Improved expired cache cleanup"""
+        async with self.lock:
+            current_time = datetime.now()
+            expired_ids = []
+
+            # Identify expired entries
+            for song_id, data in self.cache.items():
+                if current_time - data.added_at > timedelta(hours=1):
+                    if not data.is_downloading or data.download_retries >= data.max_retries:
+                        expired_ids.append(song_id)
+
+            # Remove expired entries
+            for song_id in expired_ids:
+                await self.remove(song_id)
+
+            logger.info(f"Cleaned up {len(expired_ids)} expired cache entries")
 
 
 # Utility Functions
@@ -269,87 +411,6 @@ class DownloadQueue:
             finally:
                 self.active.remove(song_id)
                 self.queue.task_done()
-
-
-# Part 3: Cache Manager and YTDLSource
-
-class CacheManager:
-    def __init__(self):
-        self.cache: Dict[str, SongData] = {}
-        self.lock = Lock()
-        self._cleanup_task = None
-        self.download_queue = DownloadQueue()
-
-    async def get(self, song_id: str) -> Optional[SongData]:
-        """Get a song from cache."""
-        async with self.lock:
-            return self.cache.get(song_id)
-
-    async def set(self, song_id: str, song_data: SongData) -> None:
-        """Add or update a song in cache."""
-        async with self.lock:
-            self.cache[song_id] = song_data
-
-    async def remove(self, song_id: str) -> None:
-        """Remove a song from cache."""
-        async with self.lock:
-            if song_id in self.cache:
-                song_data = self.cache[song_id]
-                if song_data.file_path and os.path.exists(song_data.file_path):
-                    try:
-                        os.remove(song_data.file_path)
-                        logger.debug(f"Deleted file: {song_data.file_path}")
-                    except OSError as e:
-                        logger.error(f"Failed to delete file: {e}")
-                self.cache.pop(song_id)
-
-    async def cleanup_expired(self) -> None:
-        """Remove expired entries and their files."""
-        async with self.lock:
-            current_time = datetime.now()
-            expired_ids = [
-                song_id for song_id, data in self.cache.items()
-                if (current_time - data.added_at) > timedelta(hours=1) and not data.is_downloading
-            ]
-
-            for song_id in expired_ids:
-                await self.remove(song_id)
-
-    def start_cleanup_task(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Start the periodic cleanup task."""
-
-        async def cleanup_loop():
-            while True:
-                try:
-                    await asyncio.sleep(CACHE_CLEANUP_INTERVAL)
-                    await self.cleanup_expired()
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    logger.error(f"Cache cleanup error: {e}")
-
-        self._cleanup_task = loop.create_task(cleanup_loop())
-
-    def stop_cleanup_task(self) -> None:
-        """Stop the cleanup task."""
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-
-    async def get_or_download(self, song_id: str, url: str, download_callback) -> SongData:
-        """Get a song from cache or download it if not present."""
-        song_data = await self.get(song_id)
-        if not song_data:
-            song_data = SongData(
-                title="Downloading...",
-                url=url,
-                thumbnail="",
-                duration=0,
-                is_downloading=True
-            )
-            await self.set(song_id, song_data)
-            await self.download_queue.add_download(song_id, url, download_callback)
-        return song_data
-
 
 class YTDLSource:
     def __init__(self, file_path: str, data: dict, thumbnail: str, duration: int,
@@ -891,9 +952,137 @@ class MusicPlayer:
         self.messages_to_clean = set()
         self.is_playing = False
         self.download_queue = DownloadQueue()
+        self.queue_lock = asyncio.Lock()
+        # Task management
+        self.tasks = []
+        self.start_tasks()
 
+        self._volume_file = os.path.join(music_dir, "volume.json")
+        self._volume = self._load_volume()
+
+        self.error_count = 0
+        self.max_errors = 3
+        self.last_error_time = None
+        self.error_reset_interval = 300  # 5 minutes
+
+    def _load_volume(self) -> float:
+        """Load saved volume or return default."""
+        try:
+            if os.path.exists(self._volume_file):
+                with open(self._volume_file, 'r') as f:
+                    data = json.load(f)
+                    return float(data.get('volume', DEFAULT_VOLUME))
+        except Exception as e:
+            logger.error(f"Error loading volume: {e}")
+        return DEFAULT_VOLUME
+
+    async def set_volume(self, volume: float):
+        """Set and save volume with directory check."""
+        self._volume = volume
+        try:
+            volume_dir = os.path.dirname(self._volume_file)
+            os.makedirs(volume_dir, exist_ok=True)
+            with open(self._volume_file, 'w') as f:
+                json.dump({'volume': volume}, f)
+        except Exception as e:
+            logger.error(f"Error saving volume: {e}")
+
+    def start_tasks(self):
+        """Start background tasks with proper error handling."""
+        # Voice channel monitoring
+        check_task = self.bot.loop.create_task(self.check_voice_channel())
+        check_task.add_done_callback(self.task_error_handler)
+        self.tasks.append(check_task)
+
+        # Cleanup task
+        cleanup_task = self.bot.loop.create_task(self.periodic_cleanup())
+        cleanup_task.add_done_callback(self.task_error_handler)
+        self.tasks.append(cleanup_task)
+
+    def task_error_handler(self, task):
+        """Handle task completion and errors."""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Task error: {e}")
+            # Restart the task if it wasn't intentionally cancelled
+            if not task.cancelled():
+                new_task = self.bot.loop.create_task(task.get_coro())
+                new_task.add_done_callback(self.task_error_handler)
+                self.tasks.append(new_task)
+
+    async def handle_error(self, error: Exception):
+        """Handle errors with automatic recovery."""
+        current_time = datetime.now()
+
+        # Reset error count if enough time has passed
+        if (self.last_error_time and
+                (current_time - self.last_error_time).total_seconds() > self.error_reset_interval):
+            self.error_count = 0
+
+        self.last_error_time = current_time
+        self.error_count += 1
+
+        logger.error(f"Playback error: {error}")
+
+        if self.error_count >= self.max_errors:
+            await self.handle_critical_error()
+        else:
+            # Try to recover
+            await self.attempt_recovery()
+
+    async def attempt_recovery(self):
+        """Attempt to recover from errors."""
+        try:
+            logger.info("Attempting playback recovery")
+
+            # Disconnect and reconnect voice client
+            if self.voice_client:
+                try:
+                    await self.voice_client.disconnect()
+                except:
+                    pass
+
+            if not await self.connect_to_voice(self.voice_client.channel):
+                logger.error("Failed to reconnect voice client")
+                return
+
+            # Try to resume playback
+            if self.current:
+                await self.play_next()
+
+        except Exception as e:
+            logger.error(f"Recovery attempt failed: {e}")
+
+    async def handle_critical_error(self):
+        """Handle critical errors by restarting the player."""
+        try:
+            logger.warning("Handling critical error - restarting player")
+            await self.cleanup()
+
+            # Notify users
+            error_embed = discord.Embed(
+                title="⚠️ 오류 발생",
+                description="음악 재생 중 오류가 발생하여 재시작합니다.",
+                color=discord.Color.red()
+            )
+            await self.channel.send(embed=error_embed)
+
+            # Reset state
+            self.error_count = 0
+            self.last_error_time = None
+
+            # Restart tasks
+            self.start_tasks()
+
+        except Exception as e:
+            logger.error(f"Failed to handle critical error: {e}")
+
+    # Add this to MusicPlayer class
     async def connect_to_voice(self, voice_channel: discord.VoiceChannel) -> bool:
-        """Connect to a voice channel with error handling."""
+        """Connect to a voice channel with improved error handling."""
         try:
             if self.voice_client:
                 if self.voice_client.is_connected():
@@ -901,10 +1090,24 @@ class MusicPlayer:
                         await self.voice_client.move_to(voice_channel)
                     return True
                 else:
-                    await self.voice_client.disconnect()
+                    try:
+                        await self.voice_client.disconnect()
+                    except:
+                        pass
                     self.voice_client = None
 
-            self.voice_client = await voice_channel.connect()
+            # Add delay before connecting to avoid rate limits
+            await asyncio.sleep(0.5)
+            self.voice_client = await voice_channel.connect(
+                timeout=10.0,
+                reconnect=True,
+                self_deaf=True  # Add this to reduce CPU usage
+            )
+
+            # Set up reconnection handler
+            self.voice_client._player = self
+            self.voice_client.on_disconnect = self.handle_disconnect
+
             return True
         except Exception as e:
             logger.error(f"Voice connection error: {e}")
@@ -914,6 +1117,15 @@ class MusicPlayer:
         """Clean up resources and reset player state with improved cleanup."""
         try:
             logger.debug("MusicPlayer.cleanup called")
+
+            for task in self.tasks:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            self.tasks.clear()
 
             # Stop playback and disconnect
             if self.voice_client:
@@ -969,6 +1181,9 @@ class MusicPlayer:
         if not file_path or not os.path.exists(file_path):
             return
 
+        if self.current and self.current.get('file_path') == file_path:
+            return
+
         for attempt in range(max_retries):
             try:
                 os.remove(file_path)
@@ -976,9 +1191,7 @@ class MusicPlayer:
                 break
             except PermissionError:
                 await asyncio.sleep(1)
-                continue
             except FileNotFoundError:
-                logger.debug(f"File already deleted: {file_path}")
                 break
             except Exception as e:
                 logger.error(f"Error deleting file {file_path}: {e}")
@@ -1016,26 +1229,41 @@ class MusicPlayer:
         except Exception as e:
             logger.error(f"Error cleaning up music directory: {e}")
 
+    # Add to MusicPlayer class
     async def check_voice_channel(self):
-        """Monitor voice channel for inactivity."""
+        """Monitor voice channel status."""
         try:
-            logger.debug("MusicPlayer.check_voice_channel started")
             await self.bot.wait_until_ready()
 
             while not self.bot.is_closed():
                 try:
-                    if self.voice_client and len(self.voice_client.channel.members) <= 1:
-                        logger.info("No users remaining in voice channel, cleaning up")
-                        await self.cleanup_and_disconnect()
-                        break
+                    if self.voice_client:
+                        # Check if bot is alone
+                        if len(self.voice_client.channel.members) <= 1:
+                            await self.cleanup_and_disconnect()
+                            break
+
+                        # Check connection health
+                        if not self.voice_client.is_connected():
+                            logger.warning("Voice client disconnected, attempting to reconnect")
+                            await self.handle_disconnect()
+
+                        # Check for hanging playback
+                        if self.voice_client.is_playing() and not self.current:
+                            logger.warning("Inconsistent playback state detected")
+                            self.voice_client.stop()
+                            await self.play_next()
+
+                    await asyncio.sleep(10)  # Check every 10 seconds
+
                 except Exception as e:
-                    logger.error(f"Voice channel check error: {e}")
-                await asyncio.sleep(10)
+                    logger.error(f"Error in voice channel check: {e}")
+                    await asyncio.sleep(5)
 
         except asyncio.CancelledError:
-            logger.debug("MusicPlayer.check_voice_channel cancelled")
+            logger.debug("Voice channel check task cancelled")
         except Exception as e:
-            logger.exception(f"Voice channel check error: {e}")
+            logger.error(f"Fatal error in voice channel check: {e}")
 
     async def cleanup_and_disconnect(self):
         """Clean up messages and disconnect."""
@@ -1061,30 +1289,43 @@ class MusicPlayer:
 
     # Continue MusicPlayer class...
     async def add_to_queue(self, song_data: Dict[str, Any], song_id: str) -> None:
-        """Add a song to the queue."""
-        song_entry = await self.cache_manager.get(song_id)
-        if song_entry:
-            if song_entry.is_downloading:
-                logger.info(f"Already downloading: {song_entry.title}")
+        async with self.queue_lock:
+            """Add a song to the queue."""
+            song_entry = await self.cache_manager.get(song_id)
+            if song_entry:
+                if song_entry.is_downloading:
+                    logger.info(f"Already downloading: {song_entry.title}")
+                else:
+                    logger.info(f"Already downloaded: {song_entry.title}")
             else:
-                logger.info(f"Already downloaded: {song_entry.title}")
-        else:
-            song_entry = SongData(
-                title=song_data.get('title'),
-                url=song_data.get('webpage_url'),
-                thumbnail=song_data.get('thumbnail', ''),
-                duration=song_data.get('duration', 0),
-                is_downloading=True
-            )
-            await self.cache_manager.set(song_id, song_entry)
-            song_entry.download_future = asyncio.create_task(
-                self.download_song(song_id, song_data))
+                song_entry = SongData(
+                    title=song_data.get('title'),
+                    url=song_data.get('webpage_url'),
+                    thumbnail=song_data.get('thumbnail', ''),
+                    duration=song_data.get('duration', 0),
+                    is_downloading=True
+                )
+                await self.cache_manager.set(song_id, song_entry)
+                song_entry.download_future = asyncio.create_task(
+                    self.download_song(song_id, song_data))
 
-        self.queue.append(song_id)
-        await self.update_controls()
+            self.queue.append(song_id)
+            await self.update_controls()
 
     async def download_song(self, song_id: str, song_data: dict):
         """Download a song with error handling."""
+        try:
+            logger.debug(f"Queuing song download: song_id={song_id}")
+            await self.bot.loop.create_task(self._download_song(song_id, song_data))
+        except Exception as e:
+            logger.exception(f"Error queuing download for {song_data.get('title')}: {e}")
+            if song_id in self.queue:
+                self.queue.remove(song_id)
+            await self.cache_manager.remove(song_id)
+            await self.update_now_playing()
+
+    async def _download_song(self, song_id: str, song_data: dict):
+        """Perform the actual song download in a separate task."""
         try:
             logger.debug(f"Downloading song: song_id={song_id}")
             song_info, file_path = await YTDLSource.download_song(
@@ -1098,7 +1339,6 @@ class MusicPlayer:
                 await self.cache_manager.set(song_id, song_entry)
 
             logger.debug(f"Download completed: song_id={song_id}")
-
         except Exception as e:
             logger.exception(f"Download failed for {song_data.get('title')}: {e}")
             if song_id in self.queue:
@@ -1139,45 +1379,64 @@ class MusicPlayer:
             logger.exception(f"Update now playing error: {e}")
 
     async def create_now_playing_embed(self) -> discord.Embed:
-        """Create the now playing embed."""
         embed = discord.Embed(color=discord.Color.blue())
+
+        # In create_now_playing_embed
+        thumbnail_url = self.current.get('thumbnail')
+        if thumbnail_url and is_url(thumbnail_url):
+            try:
+                embed.set_thumbnail(url=thumbnail_url)
+            except Exception:
+                # Fallback to default thumbnail
+                if is_url(self.default_thumbnail):
+                    embed.set_thumbnail(url=self.default_thumbnail)
+        elif is_url(self.default_thumbnail):
+            embed.set_thumbnail(url=self.default_thumbnail)
 
         if not self.current:
             embed.title = "🎵 현재 재생 중인 곡 없음"
             embed.description = "현재 재생 중인 곡이 없습니다."
             embed.color = discord.Color.red()
-            if is_url(self.default_thumbnail):
-                embed.set_thumbnail(url=self.default_thumbnail)
         else:
             embed.title = "🎵 현재 재생 중"
             duration = format_duration(self.current.get('duration', 0))
             current_volume = int(self._volume * 100)
 
+            queue_position = f"대기열: {len(self.queue)}곡" if self.queue else "대기열 없음"
+
             embed.add_field(
                 name="곡 정보",
-                value=f"**{self.current['title']}**\n⏱️ {duration}\n🔊 볼륨: {current_volume}%",
+                value=f"**{self.current['title']}**\n⏱️ {duration}\n🔊 볼륨: {current_volume}%\n📋 {queue_position}",
                 inline=False
             )
 
             if self.loop:
                 embed.add_field(name="반복 모드", value="🔄 활성화", inline=False)
 
-            # Set thumbnail
-            thumbnail_url = self.current.get('thumbnail')
-            if thumbnail_url and is_url(thumbnail_url):
-                embed.set_thumbnail(url=thumbnail_url)
-            elif is_url(self.default_thumbnail):
-                embed.set_thumbnail(url=self.default_thumbnail)
+            # Add progress bar
+            if self.voice_client and self.voice_client.is_playing():
+                total_seconds = self.current.get('duration', 0)
+                if total_seconds > 0:
+                    try:
+                        # Use audio position to calculate progress
+                        audio_position = getattr(self.voice_client, '_player', None)
+                        if audio_position:
+                            position_seconds = int((audio_position.loops * audio_position.frame_length) / 48000)
+                            position_seconds = min(position_seconds, total_seconds)
 
-            # Add next song info if available
-            if self.queue:
-                next_song = await self.get_next_song_info()
-                if next_song:
-                    embed.add_field(
-                        name="다음 곡",
-                        value=f"**{next_song['title']}**\n⏱️ {format_duration(next_song['duration'])}",
-                        inline=False
-                    )
+                            progress = "▬" * 20
+                            progress_position = int(20 * (position_seconds / total_seconds))
+                            progress = progress[:progress_position] + "🔘" + progress[progress_position + 1:]
+
+                            current_time = format_duration(position_seconds)
+                            total_time = format_duration(total_seconds)
+                            progress_text = f"{current_time} {progress} {total_time}"
+
+                            embed.add_field(name="진행 상태", value=progress_text, inline=False)
+                    except Exception as e:
+                        logger.error(f"Error creating progress bar: {e}")
+                        progress = "▬" * 20 + " [재생 중]"
+                        embed.add_field(name="진행 상태", value=progress, inline=False)
 
         return embed
 
@@ -1196,79 +1455,80 @@ class MusicPlayer:
         return None
 
     async def play_next(self) -> bool:
-        """Play the next song in queue."""
-        try:
-            logger.debug("Playing next song")
-            await self.cleanup_embed_message()
+        async with self.queue_lock:
+            """Play the next song in queue."""
+            try:
+                logger.debug("Playing next song")
+                await self.cleanup_embed_message()
 
-            # Handle loop functionality
-            if self.loop and self.current:
-                current_song_id = self.current['song_id']
-                if current_song_id not in self.queue:
-                    self.queue.appendleft(current_song_id)
-                    logger.debug(f"Loop mode: Added current song back to queue")
+                # Handle loop functionality
+                if self.loop and self.current:
+                    current_song_id = self.current['song_id']
+                    if current_song_id not in self.queue:
+                        self.queue.appendleft(current_song_id)
+                        logger.debug(f"Loop mode: Added current song back to queue")
 
-            if not self.queue:
-                self.current = None
-                await self.update_now_playing()
-                return False
+                if not self.queue:
+                    self.current = None
+                    await self.update_now_playing()
+                    return False
 
-            # Get next song
-            song_id = self.queue[0]  # Peek at next song without removing
-            song_entry = await self.cache_manager.get(song_id)
+                # Get next song
+                song_id = self.queue[0]  # Peek at next song without removing
+                song_entry = await self.cache_manager.get(song_id)
 
-            if not song_entry:
-                logger.error(f"Song ID {song_id} not found in cache")
-                self.queue.popleft()  # Remove invalid song
-                return await self.play_next()
+                if not song_entry:
+                    logger.error(f"Song ID {song_id} not found in cache")
+                    self.queue.popleft()  # Remove invalid song
+                    return await self.play_next()
 
-            # Wait for download if needed
-            if song_entry.is_downloading:
-                try:
-                    await asyncio.wait_for(song_entry.download_future, timeout=30)
-                except asyncio.TimeoutError:
-                    logger.error(f"Download timeout for {song_entry.title}")
+                # Wait for download if needed
+                if song_entry.is_downloading:
+                    try:
+                        await asyncio.wait_for(song_entry.download_future, timeout=30)
+                    except asyncio.TimeoutError:
+                        logger.error(f"Download timeout for {song_entry.title}")
+                        self.queue.popleft()
+                        return await self.play_next()
+
+                # Verify file exists
+                if not song_entry.file_path or not os.path.exists(song_entry.file_path):
+                    logger.error(f"File not found for {song_entry.title}")
                     self.queue.popleft()
                     return await self.play_next()
 
-            # Verify file exists
-            if not song_entry.file_path or not os.path.exists(song_entry.file_path):
-                logger.error(f"File not found for {song_entry.title}")
-                self.queue.popleft()
-                return await self.play_next()
+                # Create audio source
+                audio_source = discord.FFmpegPCMAudio(song_entry.file_path, **ffmpeg_options)
+                transformed_source = PCMVolumeTransformer(audio_source, volume=self._volume)
 
-            # Create audio source
-            audio_source = discord.FFmpegPCMAudio(song_entry.file_path, **ffmpeg_options)
-            transformed_source = PCMVolumeTransformer(audio_source, volume=self._volume)
-
-            # Start playback
-            if self.voice_client and self.voice_client.is_connected():
-                self.queue.popleft()  # Remove song from queue only after everything is ready
-                self.voice_client.play(
-                    transformed_source,
-                    after=lambda e: asyncio.run_coroutine_threadsafe(
-                        self.handle_playback_finished(e), self.bot.loop
+                # Start playback
+                if self.voice_client and self.voice_client.is_connected():
+                    self.queue.popleft()  # Remove song from queue only after everything is ready
+                    self.voice_client.play(
+                        transformed_source,
+                        after=lambda e: asyncio.run_coroutine_threadsafe(
+                            self.handle_playback_finished(e), self.bot.loop
+                        )
                     )
-                )
 
-                self.current = {
-                    'title': song_entry.title,
-                    'duration': song_entry.duration,
-                    'thumbnail': song_entry.thumbnail,
-                    'file_path': song_entry.file_path,
-                    'song_id': song_id
-                }
+                    self.current = {
+                        'title': song_entry.title,
+                        'duration': song_entry.duration,
+                        'thumbnail': song_entry.thumbnail,
+                        'file_path': song_entry.file_path,
+                        'song_id': song_id
+                    }
 
-                await self.update_now_playing()
-                logger.info(f"Now playing: {song_entry.title}")
-                return True
-            else:
-                logger.error("Voice client is not connected")
+                    await self.update_now_playing()
+                    logger.info(f"Now playing: {song_entry.title}")
+                    return True
+                else:
+                    logger.error("Voice client is not connected")
+                    return False
+
+            except Exception as e:
+                logger.exception(f"Error in play_next: {e}")
                 return False
-
-        except Exception as e:
-            logger.exception(f"Error in play_next: {e}")
-            return False
 
     async def handle_playback_finished(self, error):
         """Handle playback finished event."""
@@ -1289,14 +1549,46 @@ class MusicPlayer:
             'song_id': song_entry.song_id if hasattr(song_entry, 'song_id') else None
         }
 
+    # Add to MusicPlayer class
     async def handle_disconnect(self):
-        """Handle disconnection from voice channel."""
+        """Handle voice client disconnection with reconnection attempts."""
         try:
+            logger.warning("Voice client disconnected")
+
+            if not self.voice_client or not hasattr(self.voice_client, 'channel'):
+                return
+
+            channel = self.voice_client.channel
+
+            # Try to reconnect
+            for attempt in range(3):
+                try:
+                    logger.info(f"Attempting to reconnect (attempt {attempt + 1}/3)")
+                    await asyncio.sleep(1 * (attempt + 1))  # Increasing delay between attempts
+
+                    self.voice_client = await channel.connect(
+                        timeout=10.0,
+                        reconnect=True,
+                        self_deaf=True
+                    )
+
+                    # Restore playback if successful
+                    if self.current:
+                        await self.play_next()
+
+                    logger.info("Successfully reconnected")
+                    return
+
+                except Exception as e:
+                    logger.error(f"Reconnection attempt {attempt + 1} failed: {e}")
+
+            # If all reconnection attempts fail, cleanup
+            logger.error("All reconnection attempts failed")
             await self.cleanup()
-            self.voice_client = None
-            logger.info("Successfully handled disconnect")
+
         except Exception as e:
-            logger.error(f"Error handling disconnect: {e}")
+            logger.error(f"Error in disconnect handler: {e}")
+            await self.cleanup()
 
 
 # Part 6: Music Cog Class
@@ -1512,18 +1804,40 @@ class MusicCog(commands.Cog, name="Music"):
             return []
 
     def create_search_results_embed(self, results: List[Dict]) -> discord.Embed:
-        """Create embed for search results."""
-        embed = discord.Embed(title="🔍 검색 결과", color=discord.Color.blue())
-        embed.set_footer(text="60초 후에 자동으로 만료됩니다.")
+        """Create enhanced search results embed."""
+        embed = discord.Embed(
+            title="🔍 검색 결과",
+            description="아래 번호를 클릭하여 곡을 선택하세요.",
+            color=discord.Color.blue()
+        )
 
         for idx, result in enumerate(results, 1):
             title = result.get('title', 'Unknown Title')[:100]
             duration = format_duration(result.get('duration', 0))
+            views = result.get('view_count', 0)
+            views_str = f"{views:,}" if views else "정보 없음"
+
+            channel = result.get('channel', 'Unknown Channel')
+            upload_date = result.get('upload_date', '')
+            if upload_date:
+                upload_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
+
             embed.add_field(
                 name=f"{idx}. {title}",
-                value=f"⏱️ {duration}",
+                value=f"⏱️ {duration} | 👁️ {views_str}\n📺 {channel}\n📅 {upload_date}",
                 inline=False
             )
+
+        embed.set_footer(text="60초 후에 자동으로 만료됩니다.")
+
+        # Add random tip
+        tips = [
+            "💡 URL을 직접 입력하여 재생할 수도 있습니다.",
+            "💡 재생 중 '볼륨' 명령어로 소리 크기를 조절할 수 있습니다.",
+            "💡 '반복' 명령어로 현재 곡을 반복 재생할 수 있습니다.",
+            "💡 '셔플' 명령어로 대기열을 무작위로 섞을 수 있습니다."
+        ]
+        embed.add_field(name="팁", value=random.choice(tips), inline=False)
 
         return embed
 
@@ -1654,7 +1968,7 @@ class MusicCog(commands.Cog, name="Music"):
 
             volume = level / 100
             player.voice_client.source.volume = volume
-            player._volume = volume
+            await player.set_volume(volume)  # Save volume
             await interaction.response.send_message(f"볼륨을 {level}%로 설정했습니다.", ephemeral=True)
             await player.update_now_playing()
             logger.debug(f"볼륨 조절: {level}%")
