@@ -58,9 +58,8 @@ class MyBot(commands.Bot):
         self._loaded_cogs = set()
 
     async def setup_hook(self):
-        self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context))
+        failed_cogs = []
 
-        # Cog 자동 로딩
         for filename in os.listdir('./cogs'):
             if filename.endswith('.py') and filename != '__init__.py':
                 extension = f'cogs.{filename[:-3]}'
@@ -69,22 +68,57 @@ class MyBot(commands.Bot):
                         await self.load_extension(extension)
                         self._loaded_cogs.add(extension)
                     except Exception as e:
-                        logger.error(f'{extension} 로드 중 오류 발생: {e}')
+                        logger.error(f'{extension} load failed: {e}')
+                        failed_cogs.append((extension, str(e)))
 
-        # 슬래시 명령어 동기화
-        try:
-            await self.tree.sync()
-        except Exception as e:
-            logger.error(f"슬래시 명령어 동기화 중 오류: {e}")
+        if failed_cogs:
+            # Try to reload failed cogs after a delay
+            async def retry_failed_cogs():
+                await asyncio.sleep(5)
+                for extension, error in failed_cogs:
+                    try:
+                        await self.load_extension(extension)
+                        self._loaded_cogs.add(extension)
+                        logger.info(f'Successfully reloaded {extension}')
+                    except Exception as e:
+                        logger.error(f'Retry loading {extension} failed: {e}')
+
+            self.loop.create_task(retry_failed_cogs())
 
     async def on_ready(self):
-        activity = discord.Game(name="/도움말")
-        await self.change_presence(status=discord.Status.online, activity=activity)
+        activities = [
+            discord.Game(name="/도움말"),
+            discord.Activity(type=discord.ActivityType.listening, name="명령어"),
+            discord.Game(name="문의: example@mail.com")
+        ]
+
+        async def rotate_activity():
+            idx = 0
+            while True:
+                activity = activities[idx]
+                await self.change_presence(status=discord.Status.online, activity=activity)
+                idx = (idx + 1) % len(activities)
+                await asyncio.sleep(300)  # 5 minutes
+
+        self.loop.create_task(rotate_activity())
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-        await super().close()
+        """Graceful shutdown with cleanup"""
+        try:
+            # Clean up session
+            if self.session and not self.session.closed:
+                await self.session.close()
+
+            # Clean up cogs
+            for extension in list(self._loaded_cogs):
+                try:
+                    await self.unload_extension(extension)
+                except Exception as e:
+                    logger.error(f'Extension {extension} unload failed: {e}')
+
+            await super().close()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
 
 # 봇 객체 생성
 bot = MyBot()
@@ -99,36 +133,32 @@ async def on_error(event, *args, **kwargs):
 async def on_app_command_error(interaction: Interaction, error: app_commands.AppCommandError):
     try:
         if isinstance(error, app_commands.CommandOnCooldown):
+            retry_after = round(error.retry_after)
             await interaction.response.send_message(
-                f"명령어를 너무 자주 사용했습니다. {error.retry_after:.1f}초 후에 다시 시도하세요.",
+                f"명령어 쿨다운: {retry_after}초 남음",
                 ephemeral=True
             )
         elif isinstance(error, app_commands.CheckFailure):
             await interaction.response.send_message(
-                "이 명령어를 사용할 권한이 없거나 DM에서 사용할 수 없는 명령어입니다.",
+                "권한이 없거나 이 채널에서 사용할 수 없는 명령어입니다.",
                 ephemeral=True
             )
         elif isinstance(error, app_commands.CommandInvokeError):
-            logger.error(f"명령어 실행 중 오류 발생: {error.original}")
+            # Log the full error traceback
+            logger.exception("Command error", exc_info=error.original)
+
+            error_msg = "명령어 실행 중 오류가 발생했습니다."
+            if isinstance(error.original, discord.HTTPException):
+                error_msg = "Discord API 오류가 발생했습니다."
+            elif isinstance(error.original, asyncio.TimeoutError):
+                error_msg = "요청 시간이 초과되었습니다."
+
             if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "명령어 실행 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
-                    ephemeral=True
-                )
+                await interaction.response.send_message(error_msg, ephemeral=True)
             else:
-                await interaction.followup.send(
-                    "명령어 실행 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
-                    ephemeral=True
-                )
-        else:
-            logger.error(f"예상치 못한 명령어 오류: {error}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "알 수 없는 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
-                    ephemeral=True
-                )
+                await interaction.followup.send(error_msg, ephemeral=True)
     except Exception as e:
-        logger.error(f"에러 핸들러에서 오류 발생: {e}")
+        logger.exception(f"Error handler failed: {e}")
 
 # 슬래시 명령어: 도움말
 @bot.tree.command(
