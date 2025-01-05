@@ -994,11 +994,6 @@ class MusicPlayer:
         check_task.add_done_callback(self.task_error_handler)
         self.tasks.append(check_task)
 
-        # Cleanup task
-        cleanup_task = self.bot.loop.create_task(self.periodic_cleanup())
-        cleanup_task.add_done_callback(self.task_error_handler)
-        self.tasks.append(cleanup_task)
-
     def task_error_handler(self, task):
         """Handle task completion and errors."""
         try:
@@ -1603,6 +1598,9 @@ class MusicCog(commands.Cog, name="Music"):
         self.cache_manager = CacheManager()
         self.cache_manager.start_cleanup_task(self.bot.loop)
         self.voice_connection_pool = VoiceConnectionPool()
+
+        self.cache_manager = CacheManager()
+        self.cache_manager.start_cleanup_task(self.bot.loop)
 
     async def cog_unload(self):
         """Clean up when the cog is unloaded."""
