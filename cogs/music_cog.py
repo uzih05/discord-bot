@@ -14,6 +14,9 @@ import yt_dlp
 import logging
 from typing import Optional, Dict, List, Tuple, Set
 import shutil
+from urllib.parse import urlparse
+import re
+from dataclasses import dataclass
 
 # =============================================================================
 # Logging Setup
@@ -27,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 class Song:
     """Represents a song in the queue"""
+
     def __init__(self, source: dict, requester: discord.Member):
         self.source = source
         self.requester = requester
@@ -34,6 +38,12 @@ class Song:
         self.thumbnail = source.get('thumbnail', '')
         self.duration = source.get('duration', 0)
         self.filename = source.get('filename', '')
+        self.preloaded = False  # Add this line
+        self.added_at = time.time()  # Add this line
+
+    @property
+    def age(self) -> float:
+        return time.time() - self.added_at
 
 class MusicQueue:
     """Manages the music queue and playback state"""
@@ -118,6 +128,115 @@ class SongCache:
 
         for video_id in expired:
             del self.cache[video_id]
+
+class MusicBotError(Exception):
+    """Base exception for music bot"""
+    pass
+
+class DownloadError(MusicBotError):
+    """Download related errors"""
+    pass
+
+class ResourceLimitError(MusicBotError):
+    """Resource limit exceeded"""
+    pass
+
+
+@dataclass
+class ResourceLimits:
+    max_queue_size: int = 100
+    max_song_duration: int = 3600  # 1 hour
+    max_total_duration: int = 18000  # 5 hours
+    max_cached_files: int = 50
+    cache_duration: int = 3600  # 1 hour
+
+
+class SecurityManager:
+    """Manages security aspects of the bot"""
+
+    def __init__(self):
+        self.url_whitelist = [
+            'youtube.com',
+            'youtu.be',
+            'soundcloud.com'
+        ]
+        self.command_rate_limiter = RateLimiter(calls=5, period=60)
+
+    def validate_url(self, url: str) -> bool:
+        """Validate URL against whitelist"""
+        try:
+            parsed = urlparse(url)
+            return any(domain in parsed.netloc for domain in self.url_whitelist)
+        except Exception:
+            return False
+
+    def sanitize_query(self, query: str) -> str:
+        """Sanitize search query"""
+        sanitized = re.sub(r'[;&|]', '', query)
+        return sanitized[:200]  # Limit query length
+
+
+class RateLimiter:
+    """Rate limiting implementation"""
+
+    def __init__(self, calls: int, period: float):
+        self.calls = calls
+        self.period = period
+        self.timestamps: Dict[int, List[float]] = {}
+
+    async def acquire(self, user_id: int) -> bool:
+        now = time.time()
+        if user_id not in self.timestamps:
+            self.timestamps[user_id] = []
+
+        # Clean old timestamps
+        self.timestamps[user_id] = [ts for ts in self.timestamps[user_id]
+                                    if now - ts <= self.period]
+
+        if len(self.timestamps[user_id]) >= self.calls:
+            return False
+
+        self.timestamps[user_id].append(now)
+        return True
+
+
+class SongPreloader:
+    """Handles preloading of upcoming songs"""
+
+    def __init__(self, max_preload: int = 2):
+        self.max_preload = max_preload
+        self.preload_queue = asyncio.Queue()
+        self.current_tasks: Set[asyncio.Task] = set()
+
+    async def preload_songs(self, queue: List[Song]):
+        """Preload multiple songs asynchronously"""
+        for song in queue[:self.max_preload]:
+            if not hasattr(song, 'preloaded') or not song.preloaded:
+                task = asyncio.create_task(self._preload_song(song))
+                self.current_tasks.add(task)
+                task.add_done_callback(self.current_tasks.discard)
+
+    async def _preload_song(self, song: Song):
+        """Preload a single song"""
+        try:
+            song.preloaded = True
+        except Exception as e:
+            logger.error(f"Error preloading song {song.title}: {e}")
+
+
+async def download_with_retry(url: str, ydl_opts: dict, max_retries: int = 3) -> dict:
+    """Download with retry logic for transient failures"""
+    for attempt in range(max_retries):
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: ydl.extract_info(url, download=False)
+                )
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise DownloadError(f"Failed after {max_retries} attempts: {str(e)}")
+            await asyncio.sleep(1.5 ** attempt)  # Exponential backoff
 
 # =============================================================================
 # UI Components - Views
@@ -369,16 +488,23 @@ class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.queues: Dict[int, MusicQueue] = {}
-        self.base_music_dir = 'cogs_data/music_cog'  # Base directory
+        self.base_music_dir = 'cogs_data/music_cog'
         self.song_cache = SongCache(max_size=10)
+        self.security = SecurityManager()
+        self.resource_limits = ResourceLimits()
+        self.preloader = SongPreloader()
+        self.rate_limiter = RateLimiter(calls=5, period=60)
+
+        # Create cleanup tasks
         self.cache_cleanup_task = self.bot.loop.create_task(self.periodic_cache_cleanup())
         self.directory_cleanup_task = self.bot.loop.create_task(self.periodic_directory_cleanup())
+
+        # Create necessary directories
         os.makedirs(self.base_music_dir, exist_ok=True)
 
         # YouTube download options
         self.ydl_opts = {
             'format': 'bestaudio/best',
-            # Remove the outtmpl from here since it needs to be guild-specific
             'restrictfilenames': True,
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
@@ -583,6 +709,38 @@ class MusicCog(commands.Cog):
                 logger.error(f"Error in cache cleanup: {e}")
                 await asyncio.sleep(60)
 
+    async def process_song(self, info: dict, requester: discord.Member, ydl_opts: dict) -> Song:
+        """Process song info and download"""
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                download_info = await self.bot.loop.run_in_executor(
+                    None,
+                    lambda: ydl.extract_info(info['webpage_url'], download=True)
+                )
+
+                if not download_info:
+                    raise DownloadError("Failed to download song info")
+
+                filename = ydl.prepare_filename(download_info).replace('.webm', '.mp3').replace('.m4a', '.mp3')
+
+                if not os.path.exists(filename):
+                    raise DownloadError("Downloaded file not found")
+
+                source = {
+                    'title': download_info.get('title', 'Unknown Title'),
+                    'thumbnail': download_info.get('thumbnail'),
+                    'duration': download_info.get('duration'),
+                    'filename': filename,
+                    'id': download_info.get('id'),
+                    'webpage_url': download_info.get('webpage_url'),
+                }
+
+                return Song(source, requester)
+
+        except Exception as e:
+            logger.error(f"Error processing song: {e}")
+            raise DownloadError(f"Failed to process song: {str(e)}")
+
     # =============================================================================
     # Command Group Setup
     # =============================================================================
@@ -593,11 +751,11 @@ class MusicCog(commands.Cog):
     async def play(self, interaction: discord.Interaction, query: str):
         """Play a song command implementation"""
         try:
+            # Permission and state checks
             if not interaction.guild:
                 await interaction.response.send_message("서버에서만 사용 가능한 명령어입니다.", ephemeral=True)
                 return
 
-            # Check if bot has necessary permissions
             if not interaction.guild.voice_client and not interaction.guild.me.guild_permissions.connect:
                 await interaction.response.send_message("음성 채널 연결 권한이 없습니다.", ephemeral=True)
                 return
@@ -606,32 +764,35 @@ class MusicCog(commands.Cog):
                 await interaction.response.send_message("음성 채널에 먼저 입장해주세요.", ephemeral=True)
                 return
 
-            # Check if the music directory exists
-            guild_dir = self.get_guild_directory(interaction.guild.id)
+            # Rate limit check
+            if not await self.rate_limiter.acquire(interaction.user.id):
+                await interaction.response.send_message(
+                    "명령어 사용 제한에 걸렸습니다. 잠시 후 다시 시도해주세요.",
+                    ephemeral=True
+                )
+                return
+
+            # URL validation and sanitization
+            if query.startswith(('http://', 'https://')):
+                if not self.security.validate_url(query):
+                    await interaction.response.send_message(
+                        "지원하지 않는 URL입니다.",
+                        ephemeral=True
+                    )
+                    return
+            else:
+                query = self.security.sanitize_query(query)
 
             await interaction.response.defer()
 
-            # Log the query for debugging
-            logger.info(f"Processing play command with query: {query}")
-
             try:
                 if not query.startswith(('https://', 'http://')):
-                    # Search functionality
-                    logger.info("Performing YouTube search")
+                    # Search functionality with retry
                     with yt_dlp.YoutubeDL(self.search_opts) as ydl:
                         search_term = f"ytsearch5:{query}"
-                        info = await self.bot.loop.run_in_executor(
-                            None,
-                            lambda: ydl.extract_info(search_term, download=False)
-                        )
+                        info = await download_with_retry(search_term, self.search_opts)
 
-                        if not info:
-                            logger.error("No info returned from YouTube search")
-                            await interaction.followup.send("검색 결과를 찾을 수 없습니다.", ephemeral=True)
-                            return
-
-                        if 'entries' not in info:
-                            logger.error(f"Unexpected YouTube search response: {info}")
+                        if not info or 'entries' not in info:
                             await interaction.followup.send("검색 결과를 찾을 수 없습니다.", ephemeral=True)
                             return
 
@@ -656,73 +817,50 @@ class MusicCog(commands.Cog):
 
                         info = view.selected_entry
                 else:
-                    # Direct URL
-                    logger.info("Processing direct URL")
-                    with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
-                        info = await self.bot.loop.run_in_executor(
-                            None,
-                            lambda: ydl.extract_info(query, download=False)
-                        )
+                    # Direct URL with retry
+                    info = await download_with_retry(query, self.ydl_opts)
 
-                # Download and process the selected song
-                logger.info(f"Downloading song: {info.get('title', 'Unknown')}")
-                video_url = info.get('webpage_url') or info.get('url') or info.get('id')
-                if not video_url:
-                    await interaction.followup.send("유효한 동영상 URL을 찾을 수 없습니다.", ephemeral=True)
+                # Resource limit checks
+                if info.get('duration', 0) > self.resource_limits.max_song_duration:
+                    await interaction.followup.send("노래 길이가 제한을 초과합니다.", ephemeral=True)
                     return
 
+                queue = self.get_queue(interaction.guild.id)
+                if len(queue.queue) >= self.resource_limits.max_queue_size:
+                    await interaction.followup.send("대기열이 가득 찼습니다.", ephemeral=True)
+                    return
+
+                # Download and process
                 guild_dir = self.get_guild_directory(interaction.guild.id)
                 ydl_opts = self.ydl_opts.copy()
                 ydl_opts['outtmpl'] = os.path.join(guild_dir, '%(title)s.%(ext)s')
 
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    download_info = await self.bot.loop.run_in_executor(
-                        None,
-                        lambda: ydl.extract_info(video_url, download=True)
-                    )
+                song = await self.process_song(info, interaction.user, ydl_opts)
+                queue.queue.append(song)
+                queue.text_channel = interaction.channel
 
-                    if not download_info:
-                        logger.error("Failed to download song info")
-                        await interaction.followup.send("노래 정보를 가져올 수 없습니다.", ephemeral=True)
-                        return
+                # Connect and play
+                if not interaction.guild.voice_client:
+                    await interaction.user.voice.channel.connect()
+                    await self.play_next(interaction.guild, interaction.channel)
+                elif not interaction.guild.voice_client.is_playing():
+                    await self.play_next(interaction.guild, interaction.channel)
 
-                    filename = ydl.prepare_filename(download_info).replace('.webm', '.mp3').replace('.m4a', '.mp3')
-                    logger.info(f"Prepared filename: {filename}")
+                await interaction.followup.send(
+                    f"🎵 **{song.title}** 를 재생목록에 추가했습니다.",
+                    ephemeral=True
+                )
 
-                    if not os.path.exists(filename):
-                        logger.error(f"Downloaded file not found: {filename}")
-                        await interaction.followup.send("노래 다운로드에 실패했습니다.", ephemeral=True)
-                        return
+                # Start preloading next songs
+                await self.preloader.preload_songs(queue.queue)
 
-                    # Create song object and add to queue
-                    song = Song({
-                        'title': download_info.get('title', 'Unknown Title'),
-                        'thumbnail': download_info.get('thumbnail'),
-                        'duration': download_info.get('duration'),
-                        'filename': filename,
-                        'id': download_info.get('id'),
-                        'webpage_url': download_info.get('webpage_url'),
-                    }, interaction.user)
-
-                    queue = self.get_queue(interaction.guild.id)
-                    queue.queue.append(song)
-                    queue.text_channel = interaction.channel
-
-                    # Connect to voice channel if not already connected
-                    if not interaction.guild.voice_client:
-                        await interaction.user.voice.channel.connect()
-                        await self.play_next(interaction.guild, interaction.channel)
-                    elif not interaction.guild.voice_client.is_playing():
-                        await self.play_next(interaction.guild, interaction.channel)
-
-                    await interaction.followup.send(
-                        f"🎵 **{song.title}** 를 재생목록에 추가했습니다.",
-                        ephemeral=True
-                    )
-
+            except ResourceLimitError as e:
+                await interaction.followup.send(f"제한 초과: {str(e)}", ephemeral=True)
+            except DownloadError as e:
+                await interaction.followup.send(f"다운로드 실패: {str(e)}", ephemeral=True)
             except Exception as e:
                 logger.error(f"Error processing song: {str(e)}", exc_info=True)
-                await interaction.followup.send(f"노래 처리 중 오류가 발생했습니다.: {str(e)}", ephemeral=True)
+                await interaction.followup.send(f"노래 처리 중 오류가 발생했습니다: {str(e)}", ephemeral=True)
 
         except Exception as e:
             logger.error(f"Critical error in play command: {str(e)}", exc_info=True)
@@ -815,7 +953,7 @@ class MusicCog(commands.Cog):
 
                 embed = discord.Embed(
                     title="🎵 현재 재생 중",
-                    description=f"**{queue.current.title}**{progress_bar}\n볼륨: {int(queue.volume * 10)}",
+                    description=f"**{queue.current.title}**{progress_bar}\n볼륨: {int(queue.volume * 100)}%",
                     color=discord.Color.blue()
                 )
                 if queue.current.thumbnail:
