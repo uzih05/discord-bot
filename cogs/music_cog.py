@@ -1,2000 +1,1075 @@
-import asyncio
-import hashlib
-import logging
+"""
+Discord Music Bot - Single File Implementation
+This module contains all components of the music bot organized into logical sections.
+Part 1/3: Core Components and Models
+"""
+
 import os
-import random
-import json
-
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Dict, List, Tuple, Any, Union
-from urllib.parse import urlparse, parse_qs
-from datetime import datetime, timedelta
-from dataclasses import dataclass
-
+import time
+import asyncio
 import discord
+from discord import app_commands
+from discord.ext import commands
 import yt_dlp
-from discord import PCMVolumeTransformer, VoiceClient
-from discord import app_commands, Interaction, Embed
-from discord.ext import commands, tasks
-from discord.ui import Button, View
-from asyncio import Lock, TimeoutError as AsyncTimeoutError
+import logging
+from typing import Optional, Dict, List, Tuple, Set
+import shutil
 
-# Set up logging with more detailed format
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# =============================================================================
+# Logging Setup
+# =============================================================================
+
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# Core Models
+# =============================================================================
 
-@dataclass
-class SongData:
-    title: str
-    url: str
-    thumbnail: str
-    duration: int
-    file_path: Optional[str] = None
-    is_downloading: bool = False
-    download_future: Optional[asyncio.Future] = None
-    added_at: datetime = datetime.now()
-    download_retries: int = 0  # Added retry counter
-    max_retries: int = 3      # Maximum retry attempts
+class Song:
+    """Represents a song in the queue"""
+    def __init__(self, source: dict, requester: discord.Member):
+        self.source = source
+        self.requester = requester
+        self.title = source.get('title', 'Unknown title')
+        self.thumbnail = source.get('thumbnail', '')
+        self.duration = source.get('duration', 0)
+        self.filename = source.get('filename', '')
+
+class MusicQueue:
+    """Manages the music queue and playback state"""
+    def __init__(self):
+        self.queue: List[Song] = []
+        self._volume = 0.05  # Default volume 5%
+        self.current: Optional[Song] = None
+        self.now_playing_message: Optional[discord.Message] = None
+        self.text_channel: Optional[discord.TextChannel] = None
+        self.preloaded_song: Optional[Song] = None
+        self.start_time: Optional[float] = None
+        self.loop_mode = 'none'  # none, song, queue
+        self.last_progress_update = 0
 
     @property
-    def is_expired(self) -> bool:
-        """Check if song cache has expired (older than 1 hour)"""
-        return (datetime.now() - self.added_at) > timedelta(hours=1)
+    def volume(self) -> float:
+        return self._volume
 
-    def should_retry(self) -> bool:
-        """Check if download should be retried"""
-        return self.download_retries < self.max_retries
+    @volume.setter
+    def volume(self, value: float):
+        self._volume = min(max(value, 0.0), 1.0)
 
-# Constants with improved configuration
-CACHE_CLEANUP_INTERVAL = 1800  # Reduced to 30 minutes
-DOWNLOAD_TIMEOUT = 180        # Reduced to 3 minutes
-VOICE_TIMEOUT = 300          # Reduced to 5 minutes
-MAX_RETRIES = 3
-DEFAULT_VOLUME = 0.05
-MAX_QUEUE_SIZE = 1000       # Added queue size limit
+    def clear(self):
+        """Clear the queue and reset state"""
+        self.queue.clear()
+        self.current = None
+        self.preloaded_song = None
+        self.start_time = None
 
-# Exception classes
-class MusicBotError(Exception):
-    """Base exception class for music bot errors"""
-    pass
+    def get_song_progress(self) -> float:
+        """Get current song progress in seconds"""
+        if not self.start_time or not self.current:
+            return 0
+        return time.time() - self.start_time
 
-class DownloadError(MusicBotError):
-    """Raised when song download fails"""
-    pass
+    def toggle_loop_mode(self) -> str:
+        """Toggle between loop modes"""
+        modes = {'none': 'song', 'song': 'queue', 'queue': 'none'}
+        self.loop_mode = modes[self.loop_mode]
+        return self.loop_mode
 
-class VoiceConnectionError(MusicBotError):
-    """Raised when voice connection fails"""
-    pass
+    def shuffle(self):
+        """Shuffle the queue"""
+        import random
+        random.shuffle(self.queue)
+        self.preloaded_song = None
 
-# YT-DLP configuration with improved options
-ytdlp_format_options = {
-    'format': 'bestaudio/best',
-    'restrictfilenames': True,
-    'noplaylist': True,
-    'nocheckcertificate': True,
-    'ignoreerrors': False,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0',
-    'extract_flat': True,
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'opus',
-        'preferredquality': '192',
-    }],
-    'socket_timeout': 10,     # Added timeout
-    'retries': 3,            # Added retries
-}
+class SongCache:
+    """Manages caching of downloaded songs"""
+    def __init__(self, max_size: int = 10, max_age: int = 3600):
+        self.cache: Dict[str, Tuple[str, float]] = {}
+        self.max_size = max_size
+        self.max_age = max_age
 
-# FFmpeg configuration with improved options
-ffmpeg_options = {
-    'options': '-vn -loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -analyzeduration 0 -thread_queue_size 4096'
-}
+    def get(self, video_id: str) -> Optional[str]:
+        """Get cached filename for video ID"""
+        if video_id in self.cache:
+            filename, _ = self.cache[video_id]
+            self.cache[video_id] = (filename, time.time())
+            return filename
+        return None
 
-# Optimized thread pool
-download_executor = ThreadPoolExecutor(
-    max_workers=5,  # Reduced max workers
-    thread_name_prefix="music_downloader"
-)
+    def add(self, video_id: str, filename: str):
+        """Add a file to cache"""
+        if len(self.cache) >= self.max_size:
+            oldest = min(self.cache.items(), key=lambda x: x[1][1])
+            del self.cache[oldest[0]]
+        self.cache[video_id] = (filename, time.time())
 
-
-class VoiceConnectionPool:
-    def __init__(self):
-        self.connections = {}
-        self.lock = asyncio.Lock()
-        self.reconnect_attempts = {}
-        self.max_reconnect_attempts = 3
-
-    async def get_connection(self, channel: discord.VoiceChannel) -> discord.VoiceClient:
-        async with self.lock:
-            guild_id = channel.guild.id
-
-            if guild_id in self.connections:
-                connection = self.connections[guild_id]
-                if connection.is_connected():
-                    if connection.channel.id != channel.id:
-                        await connection.move_to(channel)
-                    return connection
-                else:
-                    # Handle disconnected state
-                    await self.handle_disconnected_connection(guild_id, channel)
-
-            # Create new connection
-            try:
-                connection = await channel.connect(timeout=10.0, reconnect=True)
-                self.connections[guild_id] = connection
-                self.reconnect_attempts[guild_id] = 0
-                return connection
-            except Exception as e:
-                logger.error(f"Failed to create voice connection: {e}")
-                raise
-
-    async def handle_disconnected_connection(self, guild_id: int, channel: discord.VoiceChannel):
-        """Handle disconnected voice connection with retry logic"""
-        if guild_id in self.reconnect_attempts:
-            if self.reconnect_attempts[guild_id] >= self.max_reconnect_attempts:
-                del self.connections[guild_id]
-                del self.reconnect_attempts[guild_id]
-                raise VoiceConnectionError("Max reconnection attempts reached")
-
-            self.reconnect_attempts[guild_id] += 1
-        else:
-            self.reconnect_attempts[guild_id] = 1
-
-        try:
-            await self.connections[guild_id].disconnect()
-        except:
-            pass
-
-        del self.connections[guild_id]
-
-    async def disconnect(self, guild_id: int):
-        """Safely disconnect and cleanup connection"""
-        if guild_id in self.connections:
-            try:
-                connection = self.connections[guild_id]
-                if connection.is_connected():
-                    await connection.disconnect()
-            except Exception as e:
-                logger.error(f"Error disconnecting: {e}")
-            finally:
-                self.connections.pop(guild_id, None)
-                self.reconnect_attempts.pop(guild_id, None)
-
-
-class CacheManager:
-    def __init__(self):
-        self.cache: Dict[str, SongData] = {}
-        self.lock = Lock()
-        self._cleanup_task = None
-        self.download_queue = DownloadQueue()
-        self._last_cleanup = datetime.now()
-        self.max_cache_size = 100  # Maximum number of songs in cache
-
-    async def get(self, song_id: str) -> Optional[SongData]:
-        """Get a song from cache."""
-        async with self.lock:
-            return self.cache.get(song_id)
-
-    async def set(self, song_id: str, song_data: SongData) -> None:
-        """Add or update a song in cache with size limit."""
-        async with self.lock:
-            if song_id not in self.cache and len(self.cache) >= self.max_cache_size:
-                # Remove oldest entry if cache is full
-                oldest_id = min(self.cache.items(), key=lambda x: x[1].added_at)[0]
-                await self.remove(oldest_id)
-            self.cache[song_id] = song_data
-
-    async def remove(self, song_id: str) -> None:
-        """Remove a song from cache and clean up its files."""
-        async with self.lock:
-            if song_id in self.cache:
-                song_entry = self.cache[song_id]
-                if song_entry.file_path and os.path.exists(song_entry.file_path):
-                    try:
-                        os.remove(song_entry.file_path)
-                        logger.debug(f"Deleted file: {song_entry.file_path}")
-                    except OSError as e:
-                        logger.error(f"Failed to delete file: {e}")
-                self.cache.pop(song_id)
-
-    async def periodic_cleanup(self):
-        """Periodic cleanup with improved logic"""
-        while True:
-            try:
-                await asyncio.sleep(CACHE_CLEANUP_INTERVAL)
-                async with self.lock:
-                    current_time = datetime.now()
-                    # Only clean if sufficient time has passed
-                    if (current_time - self._last_cleanup).total_seconds() >= CACHE_CLEANUP_INTERVAL:
-                        await self.cleanup_expired()
-                        self._last_cleanup = current_time
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Periodic cleanup error: {e}")
-                await asyncio.sleep(60)  # Wait before retrying
-
-    def start_cleanup_task(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Start the periodic cleanup task with error handling"""
-        if self._cleanup_task and not self._cleanup_task.done():
-            self._cleanup_task.cancel()
-
-        self._cleanup_task = loop.create_task(self.periodic_cleanup())
-        self._cleanup_task.add_done_callback(self._cleanup_task_done_callback)
-
-    def _cleanup_task_done_callback(self, future: asyncio.Future):
-        """Handle cleanup task completion"""
-        try:
-            future.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"Cleanup task error: {e}")
-
-    async def cleanup_expired(self) -> None:
-        """Improved expired cache cleanup"""
-        async with self.lock:
-            current_time = datetime.now()
-            expired_ids = []
-
-            # Identify expired entries
-            for song_id, data in self.cache.items():
-                if current_time - data.added_at > timedelta(hours=1):
-                    if not data.is_downloading or data.download_retries >= data.max_retries:
-                        expired_ids.append(song_id)
-
-            # Remove expired entries
-            for song_id in expired_ids:
-                await self.remove(song_id)
-
-            logger.info(f"Cleaned up {len(expired_ids)} expired cache entries")
-
-
-# Utility Functions
-def construct_youtube_url(video_id: str) -> str:
-    """Constructs a proper YouTube URL from a video ID."""
-    return f"https://www.youtube.com/watch?v={video_id}"
-
-
-def generate_song_id(url: str, title: str) -> str:
-    """Generate a unique ID for a song based on URL and title."""
-    combined = f"{url}-{title}"
-    return hashlib.md5(combined.encode()).hexdigest()[:8]
-
-
-def get_video_id(url: str) -> Optional[str]:
-    """Extract video ID from YouTube URL."""
-    try:
-        parsed = urlparse(url)
-        if parsed.hostname in ('www.youtube.com', 'youtube.com'):
-            if parsed.path == '/watch':
-                return parse_qs(parsed.query)['v'][0]
-        elif parsed.hostname == 'youtu.be':
-            return parsed.path[1:]
-    except Exception as e:
-        logger.error(f"Error extracting video ID: {e}")
-    return None
-
-def is_url(url: str) -> bool:
-    """Validate if the URL is a valid YouTube URL."""
-    try:
-        parsed = urlparse(url)
-        if parsed.netloc in ('www.youtube.com', 'youtube.com', 'youtu.be'):
-            if parsed.path == '/watch' or parsed.netloc == 'youtu.be':
-                return True
-    except Exception:
-        pass
-    return False
-
-def sanitize_query(query: str) -> str:
-    """Sanitize search query string."""
-    sanitized = ' '.join(query.split())
-    return sanitized[:100]
-
-def format_duration(seconds: int) -> str:
-    """Format duration in seconds to HH:MM:SS format."""
-    try:
-        if not seconds:
-            return "00:00"
-        hours, remainder = divmod(int(seconds), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        if hours > 0:
-            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-        return f"{minutes:02d}:{seconds:02d}"
-    except Exception as e:
-        logger.error(f"Error formatting duration: {e}")
-        return "00:00"
-
-
-def clean_filename(filename: str) -> str:
-    """Clean filename for safe file system operations."""
-    import re
-    # Replace invalid characters with underscore
-    cleaned = re.sub(r'[\\/*?:"<>|]', '_', filename)
-    # Remove leading/trailing spaces and dots
-    cleaned = cleaned.strip('. ')
-    # Ensure the filename isn't too long
-    if len(cleaned) > 200:
-        cleaned = cleaned[:197] + "..."
-    return cleaned
-
-
-async def handle_command_error(interaction: Interaction, error: Exception, message: str):
-    """Handle command errors and send appropriate response."""
-    error_msg = f"{message}: {str(error)}"
-    logger.error(error_msg)
-    try:
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
-                "오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
-                ephemeral=True
-            )
-    except Exception as e:
-        logger.error(f"Failed to send error message: {e}")
-
-
-async def delete_message_after_delay(message: discord.Message, delay: int):
-    """Delete a message after specified delay."""
-    await asyncio.sleep(delay)
-    try:
-        await message.delete()
-    except discord.NotFound:
-        pass  # Message already deleted
-    except Exception as e:
-        logger.error(f"Failed to delete message: {e}")
-
-
-
-class ErrorHandler:
-    @staticmethod
-    async def handle_ffmpeg_error(error: Exception) -> str:
-        """Handle FFmpeg-related errors."""
-        error_str = str(error).lower()
-        if "ffmpeg not found" in error_str:
-            return "FFmpeg가 설치되어 있지 않습니다. 관리자에게 문의해주세요."
-        elif "opus" in error_str:
-            return "Opus 코덱이 설치되어 있지 않습니다. 관리자에게 문의해주세요."
-        return str(error)
-
-    @staticmethod
-    async def handle_playback_error(error: Exception, player: 'MusicPlayer') -> bool:
-        """Handle playback-related errors with improved error handling."""
-        if isinstance(error, discord.ClientException):
-            await player.handle_disconnect()
-            return False
-        elif isinstance(error, discord.opus.OpusNotLoaded):
-            try:
-                discord.opus.load_opus('libopus.so.0')
-                return True
-            except:
-                return False
-        elif isinstance(error, Exception):
-            error_msg = await ErrorHandler.handle_ffmpeg_error(error)
-            logger.error(f"Playback error: {error_msg}")
-            return False
-        return False
-
-class DownloadQueue:
-    def __init__(self, max_concurrent=3):
-        self.queue = asyncio.Queue()
-        self.active = set()
-        self.max_concurrent = max_concurrent
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-
-    async def add_download(self, song_id: str, url: str, callback):
-        """Add a download task to the queue."""
-        await self.queue.put((song_id, url, callback))
-        asyncio.create_task(self._process_queue())
-
-    async def _process_queue(self):
-        """Process the download queue with rate limiting."""
-        async with self.semaphore:
-            if self.queue.empty():
-                return
-
-            song_id, url, callback = await self.queue.get()
-            if song_id in self.active:
-                self.queue.task_done()
-                return
-
-            self.active.add(song_id)
-            try:
-                await callback(song_id, url)
-            finally:
-                self.active.remove(song_id)
-                self.queue.task_done()
-
-class YTDLSource:
-    def __init__(self, file_path: str, data: dict, thumbnail: str, duration: int,
-                 song_id: str, volume: float = DEFAULT_VOLUME):
-        self.file_path = file_path
-        self.data = data
-        self.thumbnail = thumbnail
-        self.title = data.get('title', 'Unknown Title')
-        self.duration = duration
-        self.volume = volume
-        self.song_id = song_id
-        self.url = data.get('webpage_url')
-
-    @classmethod
-    async def cleanup_partial_downloads(cls, music_dir: str, song_id: str):
-        """Clean up any partial downloads for a given song ID."""
-        try:
-            partial_files = [f for f in os.listdir(music_dir) if f.startswith(song_id)]
-            for partial_file in partial_files:
+    def cleanup(self):
+        """Remove expired cache entries"""
+        current_time = time.time()
+        expired = []
+        for video_id, (filename, timestamp) in self.cache.items():
+            if current_time - timestamp > self.max_age:
+                expired.append(video_id)
                 try:
-                    os.remove(os.path.join(music_dir, partial_file))
-                    logger.info(f"Cleaned up partial download: {partial_file}")
-                except OSError as e:
-                    logger.error(f"Failed to clean up file {partial_file}: {e}")
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+                    if os.path.exists(filename):
+                        os.remove(filename)
+                except Exception as e:
+                    logger.error(f"Error removing expired cache file {filename}: {e}")
 
-    @classmethod
-    async def download_song(cls, song_id: str, url: str, music_dir: str,
-                            loop: asyncio.AbstractEventLoop) -> Tuple[Any, str]:
-        """Download a song and return its info and file path."""
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with asyncio.timeout(DOWNLOAD_TIMEOUT):
-                    # Get info without downloading
-                    info_options = ytdlp_format_options.copy()
-                    info_options['extract_flat'] = False
-                    info_options['download'] = False
+        for video_id in expired:
+            del self.cache[video_id]
 
-                    info = await loop.run_in_executor(
-                        download_executor,
-                        lambda: yt_dlp.YoutubeDL(info_options).extract_info(url, download=False)
-                    )
+# =============================================================================
+# UI Components - Views
+# =============================================================================
 
-                    if not info:
-                        raise DownloadError("No data received from yt-dlp")
-
-                    # Create output path with cleaned title
-                    clean_title = clean_filename(info.get('title', 'unknown'))
-                    base_path = os.path.join(music_dir, f'{song_id}-{clean_title}')
-
-                    # Download with specific options
-                    download_options = {
-                        'format': 'bestaudio/best',
-                        'postprocessors': [{
-                            'key': 'FFmpegExtractAudio',
-                            'preferredcodec': 'opus',
-                            'preferredquality': '192',
-                        }],
-                        'restrictfilenames': True,
-                        'noplaylist': True,
-                        'nocheckcertificate': True,
-                        'ignoreerrors': False,
-                        'logtostderr': False,
-                        'quiet': True,
-                        'no_warnings': True,
-                        'outtmpl': base_path,
-                    }
-
-                    # Download and process
-                    await loop.run_in_executor(
-                        download_executor,
-                        lambda: yt_dlp.YoutubeDL(download_options).download([url])
-                    )
-
-                    # Check for downloaded file
-                    expected_path = f"{base_path}.opus"
-                    if os.path.exists(expected_path):
-                        return info, expected_path
-
-                    # Check other possible extensions
-                    for ext in ['.opus', '.m4a', '.mp3', '.webm']:
-                        test_path = f"{base_path}{ext}"
-                        if os.path.exists(test_path):
-                            return info, test_path
-
-                    raise DownloadError("Downloaded file not found")
-
-            except AsyncTimeoutError:
-                if attempt == MAX_RETRIES - 1:
-                    raise DownloadError(f"Download timed out after {MAX_RETRIES} attempts")
-                logger.warning(f"Download attempt {attempt + 1} timed out, retrying...")
-                await asyncio.sleep(1)
-
-            except Exception as e:
-                if attempt == MAX_RETRIES - 1:
-                    raise DownloadError(f"Download failed after {MAX_RETRIES} attempts: {e}")
-                logger.warning(f"Download attempt {attempt + 1} failed: {e}, retrying...")
-                await asyncio.sleep(1)
-
-    @classmethod
-    async def from_url(cls, url: str, download: bool, loop, music_dir: str, cache_manager: CacheManager) -> Tuple[
-        'YTDLSource', str]:
-        """Create a YTDLSource from a URL."""
-        try:
-            # Extract info
-            info = await cls.get_video_info(url, loop)
-
-            # Get best thumbnail
-            thumbnail_url = cls.get_best_thumbnail(info)
-
-            # Generate song ID and path
-            song_id = generate_song_id(url, info['title'])
-            clean_title = clean_filename(info['title'])
-            file_path = os.path.join(music_dir, f'{song_id}-{clean_title}.opus')
-
-            # Handle download
-            song_entry = await cache_manager.get(song_id)
-            if not song_entry:
-                song_entry = SongData(
-                    title=info['title'],
-                    url=url,
-                    thumbnail=thumbnail_url,
-                    duration=info.get('duration', 0),
-                    is_downloading=True,
-                    file_path=file_path
-                )
-                await cache_manager.set(song_id, song_entry)
-                song_entry.download_future = asyncio.create_task(
-                    cls.download_song(song_id, url, music_dir, loop))
-
-            return cls(
-                file_path=file_path if download else info.get('url'),
-                data=info,
-                thumbnail=thumbnail_url,
-                duration=info.get('duration', 0),
-                song_id=song_id,
-                volume=DEFAULT_VOLUME
-            ), song_id
-
-        except Exception as e:
-            logger.exception(f"Error processing URL {url}: {e}")
-            raise
-
-    @staticmethod
-    async def get_video_info(url: str, loop) -> dict:
-        """Get video information without downloading."""
-        info_options = ytdlp_format_options.copy()
-        info_options['extract_flat'] = False
-        try:
-            async with asyncio.timeout(10):
-                data = await loop.run_in_executor(
-                    download_executor,
-                    lambda: yt_dlp.YoutubeDL(info_options).extract_info(url, download=False)
-                )
-                if not data:
-                    raise ValueError("No data received from yt-dlp")
-                if 'entries' in data:
-                    data = data['entries'][0]
-                return data
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout while processing URL: {url}")
-            raise
-
-    @staticmethod
-    def get_best_thumbnail(info: dict) -> Optional[str]:
-        """Get the best quality thumbnail from video info."""
-        if 'thumbnails' in info and isinstance(info['thumbnails'], list):
-            thumbnails = sorted(
-                [t for t in info['thumbnails'] if isinstance(t, dict) and 'url' in t],
-                key=lambda x: x.get('width', 0) * x.get('height', 0),
-                reverse=True
-            )
-            if thumbnails:
-                return thumbnails[0]['url']
-        return info.get('thumbnail')
-
-
-# Part 4: UI Views - Search Results and Music Controls
-
-class SearchResultsView(View):
-    def __init__(self, music_cog, interaction: Interaction, results: List[Dict]):
-        super().__init__(timeout=60)
-        self.music_cog = music_cog
-        self.original_interaction = interaction
-        self.original_user = interaction.user
-        self.voice_channel = interaction.user.voice.channel
-        self.results = results[:5]
+class SongSelectView(discord.ui.View):
+    """View for song selection interface"""
+    def __init__(self, entries, timeout=60):
+        super().__init__(timeout=timeout)
+        self.selected_entry = None
         self.message = None
+        self.entries = entries
+        self.current_page = 0
+        self.items_per_page = 5
 
-        # Add buttons for each search result
-        for index, result in enumerate(self.results, start=1):
-            button = Button(
-                label=str(index),
+        # Add selection buttons
+        for i in range(min(5, len(entries))):
+            button = discord.ui.Button(
+                label=str(i + 1),
                 style=discord.ButtonStyle.primary,
-                custom_id=f"select_{index}"
+                custom_id=f"select_{i}"
             )
-            button.callback = self.create_callback(index - 1)
+            button.callback = self.create_callback(entries[i])
             self.add_item(button)
 
-    def create_callback(self, index: int):
-        async def callback(interaction: Interaction):
-            # Validate user and voice state
-            if not await self.validate_interaction(interaction):
+        # Add cancel button
+        cancel_button = discord.ui.Button(
+            label="취소",
+            style=discord.ButtonStyle.danger,
+            custom_id="cancel"
+        )
+        cancel_button.callback = self.cancel_callback
+        self.add_item(cancel_button)
+
+    def create_callback(self, entry):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.message.interaction.user.id:
+                await interaction.response.send_message("다른 사용자의 선택창입니다!", ephemeral=True)
                 return
 
+            self.selected_entry = entry
+            self.stop()
+
+            embed = discord.Embed(
+                title="🎵 노래 선택 완료",
+                description=f"선택한 노래: **{entry.get('title', 'Unknown')}**\n재생 준비중...",
+                color=int('f9e54b', 16)
+            )
+
+            duration = entry.get('duration')
+            if duration:
+                minutes = int(duration) // 60
+                seconds = int(duration) % 60
+                embed.add_field(name="길이", value=f"{minutes:02d}:{seconds:02d}")
+
+            await interaction.response.edit_message(embed=embed, view=None)
+            await asyncio.sleep(3)
             try:
-                logger.debug(f"SearchResultsView button click: index={index}")
-
-                # Clean up search results message
-                await self.cleanup_search_message()
-
-                # Get selected result and prepare data
-                result = self.prepare_result(self.results[index])
-                if not result:
-                    await interaction.response.send_message(
-                        "선택한 곡의 정보를 찾을 수 없습니다.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Initialize player and song
-                player = self.music_cog.get_player(interaction.guild, interaction.channel)
-                song_id = generate_song_id(result['webpage_url'], result['title'])
-
-                # Show download status
-                await interaction.response.defer()
-                status_msg = await self.show_download_status(interaction, result)
-
-                # Add to queue and start playback
-                try:
-                    await player.add_to_queue(result, song_id)
-                    if not player.voice_client or not player.voice_client.is_playing():
-                        if not await player.play_next():
-                            await interaction.followup.send(
-                                "재생을 시작할 수 없습니다.",
-                                ephemeral=True
-                            )
-                            return
-                except Exception as e:
-                    logger.error(f"Error adding song to queue: {e}")
-                    await interaction.followup.send(
-                        "곡을 추가하는 중 오류가 발생했습니다.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Clean up status and show success message
-                await self.cleanup_and_show_success(interaction, status_msg, result)
-
-            except Exception as e:
-                logger.exception(f"Error processing selection: {e}")
-                await self.handle_error(interaction)
+                await self.message.delete()
+            except:
+                pass
 
         return callback
 
-    async def validate_interaction(self, interaction: Interaction) -> bool:
-        """Validate user interaction and voice state."""
-        if not interaction.user.voice or interaction.user.voice.channel != self.voice_channel:
-            await interaction.response.send_message(
-                "이 명령어를 사용하려면 음성 채널에 참가해야 합니다.",
-                ephemeral=True
-            )
-            return False
+    async def cancel_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.message.interaction.user.id:
+            await interaction.response.send_message("다른 사용자의 선택창입니다!", ephemeral=True)
+            return
 
-        if (interaction.guild.voice_client and
-                interaction.guild.voice_client.channel != self.voice_channel and
-                len(interaction.guild.voice_client.channel.members) > 1):
-            await interaction.response.send_message(
-                "다른 음성 채널에서 이미 음악이 재생 중입니다.",
-                ephemeral=True
-            )
-            return False
-
-        return True
-
-    async def cleanup_search_message(self):
-        """Clean up the search results message."""
-        if self.message:
-            try:
-                await self.message.delete()
-            except discord.NotFound:
-                pass
-            except Exception as e:
-                logger.error(f"Error deleting search results message: {e}")
-
-    def prepare_result(self, result: Dict) -> Optional[Dict]:
-        """Prepare the selected result data."""
-        if 'webpage_url' not in result and 'id' in result:
-            result['webpage_url'] = f"https://www.youtube.com/watch?v={result['id']}"
-        elif 'webpage_url' not in result and 'url' in result:
-            result['webpage_url'] = result['url']
-
-        if 'webpage_url' not in result:
-            return None
-
-        if 'title' not in result:
-            result['title'] = f"Unknown Title {result.get('id', 'No ID')}"
-
-        return result
-
-    async def show_download_status(self, interaction: Interaction, result: Dict) -> Optional[discord.Message]:
-        """Show download status message."""
-        try:
-            return await interaction.followup.send(
-                embed=discord.Embed(
-                    title="🔄 다운로드 중...",
-                    description=f"**{result['title']}**\n잠시만 기다려주세요...",
-                    color=discord.Color.blue()
-                ),
-                ephemeral=True
-            )
-        except Exception as e:
-            logger.error(f"Error sending status message: {e}")
-            return None
-
-    async def cleanup_and_show_success(self, interaction: Interaction, status_msg: Optional[discord.Message],
-                                       result: Dict):
-        """Clean up status message and show success message."""
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except (discord.NotFound, discord.HTTPException):
-                pass
-
-        success_msg = await interaction.followup.send(
-            f"🎵 추가됨: {result['title']}",
-            ephemeral=False
+        embed = discord.Embed(
+            title="❌ 검색 취소됨",
+            description="노래 선택이 취소되었습니다.",
+            color=discord.Color.red()
         )
-
+        await interaction.response.edit_message(embed=embed, view=None)
+        await asyncio.sleep(3)
         try:
-            await asyncio.sleep(3)
-            await success_msg.delete()
-        except (discord.NotFound, discord.HTTPException):
+            await self.message.delete()
+        except:
             pass
+        self.stop()
 
-    async def handle_error(self, interaction: Interaction):
-        """Handle errors during song selection."""
+    async def on_timeout(self):
         try:
-            await interaction.followup.send(
-                "선택한 곡을 처리하는 중 오류가 발생했습니다.",
-                ephemeral=True
+            embed = discord.Embed(
+                title="⏰ 시간 초과",
+                description="60초 내에 선택하지 않아 검색이 취소되었습니다.",
+                color=discord.Color.orange()
             )
+            await self.message.edit(embed=embed, view=None)
+            await asyncio.sleep(3)
+            await self.message.delete()
         except:
             pass
 
-    async def on_timeout(self):
-        """Handle view timeout."""
+# =============================================================================
+# UI Components - Player Controls
+# =============================================================================
+
+class PlayerControlsView(discord.ui.View):
+    """View for music player controls"""
+    def __init__(self, cog: 'MusicCog', timeout: int = None):
+        super().__init__(timeout=timeout)
+        self.cog = cog
+
+    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle previous track button"""
+        await interaction.response.defer()
+        if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
+            interaction.guild.voice_client.stop()
+
+    @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.primary)
+    async def play_pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle play/pause button"""
+        await interaction.response.defer()
+        vc = interaction.guild.voice_client
+        if not vc:
+            return
+
+        if vc.is_paused():
+            vc.resume()
+            await interaction.followup.send("▶️ 다시 재생합니다.", ephemeral=True)
+        else:
+            vc.pause()
+            await interaction.followup.send("⏸️ 일시정지되었습니다.", ephemeral=True)
+
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary)
+    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle skip button"""
+        await interaction.response.defer()
+        if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
+            interaction.guild.voice_client.stop()
+            await interaction.followup.send("⏭️ 노래를 건너뛰었습니다.", ephemeral=True)
+
+    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle loop mode button"""
+        await interaction.response.defer()
+        queue = self.cog.get_queue(interaction.guild.id)
+        mode = queue.toggle_loop_mode()
+
+        modes = {'none': '없음', 'song': '한곡', 'queue': '전체'}
+        await interaction.followup.send(f"🔁 반복 모드를 '{modes[mode]}'으로 설정했습니다.", ephemeral=True)
+
+        embed = queue.now_playing_message.embeds[0]
+        loop_modes = {'none': '', 'song': ' | 🔂 한곡 반복', 'queue': ' | 🔁 전체 반복'}
+        embed.set_footer(text=f"요청자: {queue.current.requester.display_name}{loop_modes[mode]}")
+        await queue.now_playing_message.edit(embed=embed)
+
+    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary)
+    async def shuffle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle shuffle button"""
+        await interaction.response.defer()
+        queue = self.cog.get_queue(interaction.guild.id)
+        if len(queue.queue) >= 2:
+            queue.shuffle()
+            await interaction.followup.send("🔀 대기열을 섞었습니다.", ephemeral=True)
+        else:
+            await interaction.followup.send("셔플할 노래가 충분하지 않습니다.", ephemeral=True)
+
+# =============================================================================
+# UI Components - Queue Controls
+# =============================================================================
+
+class QueueControlsView(discord.ui.View):
+    """View for queue management controls"""
+    def __init__(self, cog: 'MusicCog', format_duration, timeout: int = None):
+        super().__init__(timeout=timeout)
+        self.cog = cog
+        self.format_duration = format_duration
+        self.page = 0
+        self.max_items = 10
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle previous page button"""
+        await interaction.response.defer()
+        if self.page > 0:
+            self.page -= 1
+            await self.update_queue_message(interaction)
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle next page button"""
+        await interaction.response.defer()
+        queue = self.cog.get_queue(interaction.guild.id)
+        if (self.page + 1) * self.max_items < len(queue.queue):
+            self.page += 1
+            await self.update_queue_message(interaction)
+
+    @discord.ui.button(label="새로고침", style=discord.ButtonStyle.primary)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle refresh button"""
+        await interaction.response.defer()
+        await self.update_queue_message(interaction)
+
+    async def update_queue_message(self, interaction: discord.Interaction):
+        """Update the queue display message"""
+        queue = self.cog.get_queue(interaction.guild.id)
+        embed = discord.Embed(title="🎵 재생 대기열", color=discord.Color.blue())
+
+        if queue.current:
+            progress = queue.get_song_progress()
+            duration = queue.current.duration or 0
+            time_info = (
+                f"\n⏰ {self.format_duration(int(progress))}/{self.format_duration(duration)}"
+                if duration else ""
+            )
+            embed.add_field(
+                name="현재 재생 중",
+                value=f"**{queue.current.title}** (요청: {queue.current.requester.display_name}){time_info}",
+                inline=False
+            )
+
+        if queue.queue:
+            start_idx = self.page * self.max_items
+            end_idx = min(start_idx + self.max_items, len(queue.queue))
+            queue_slice = queue.queue[start_idx:end_idx]
+
+            accumulated_time = queue.current.duration - queue.get_song_progress() if queue.current else 0
+            for i in range(start_idx):
+                accumulated_time += queue.queue[i].duration or 0
+
+            description = []
+            for i, song in enumerate(queue_slice, start=start_idx + 1):
+                time_info = f"⏰ 예상 대기시간: {self.cog.format_duration(int(accumulated_time))}"
+                description.append(
+                    f"{i}. **{song.title}** (요청: {song.requester.display_name})\n   {time_info}"
+                )
+                accumulated_time += song.duration or 0
+
+            embed.add_field(
+                name=f"대기 중인 노래 (총 {len(queue.queue)}곡)",
+                value="\n".join(description) if description else "없음",
+                inline=False
+            )
+
+            embed.set_footer(text=f"페이지 {self.page + 1}/{(len(queue.queue) - 1) // self.max_items + 1} | "
+                                f"총 재생시간: {self.format_duration(self.cog.get_queue_duration(queue))}")
+
+        await interaction.message.edit(embed=embed, view=self)
+
+# =============================================================================
+# Main Music Cog
+# =============================================================================
+
+class MusicCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.queues: Dict[int, MusicQueue] = {}
+        self.base_music_dir = 'cogs_data/music_cog'  # Base directory
+        self.song_cache = SongCache(max_size=10)
+        self.cache_cleanup_task = self.bot.loop.create_task(self.periodic_cache_cleanup())
+        self.directory_cleanup_task = self.bot.loop.create_task(self.periodic_directory_cleanup())
+        os.makedirs(self.base_music_dir, exist_ok=True)
+
+        # YouTube download options
+        self.ydl_opts = {
+            'format': 'bestaudio/best',
+            # Remove the outtmpl from here since it needs to be guild-specific
+            'restrictfilenames': True,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'retries': 10,
+            'socket_timeout': 15,
+        }
+
+        self.search_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'extract_flat': 'in_playlist',
+            'skip_download': True,
+            'default_search': 'ytsearch',
+        }
+
+    def get_guild_directory(self, guild_id: int) -> str:
+        """Get guild-specific directory path"""
+        guild_dir = os.path.join(self.base_music_dir, str(guild_id))
+        os.makedirs(guild_dir, exist_ok=True)
+        return guild_dir
+
+    async def cleanup_guild_directory(self, guild_id: int):
+        """Clean up guild-specific directory"""
+        guild_dir = self.get_guild_directory(guild_id)
         try:
-            logger.debug("SearchResultsView timeout occurred")
-            # Disable all buttons
-            for item in self.children:
-                item.disabled = True
-
-            if self.message:
+            # Remove all files in the guild directory
+            for filename in os.listdir(guild_dir):
+                file_path = os.path.join(guild_dir, filename)
                 try:
-                    # Show timeout message
-                    timeout_embed = discord.Embed(
-                        title="⏰ 시간 만료",
-                        description="검색 시간이 초과되었습니다. 다시 검색해주세요.",
-                        color=discord.Color.red()
-                    )
-                    await self.message.edit(embed=timeout_embed, view=None)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                except Exception as e:
+                    logger.error(f"Error removing file {file_path}: {e}")
 
-                    # Delete message after delay
-                    await asyncio.sleep(5)
-                    await self.message.delete()
+            # Remove the guild directory itself
+            os.rmdir(guild_dir)
+        except Exception as e:
+            logger.error(f"Error cleaning up guild directory: {e}")
+
+    async def periodic_directory_cleanup(self):
+        """Periodically clean up empty guild directories"""
+        while not self.bot.is_closed():
+            try:
+                for guild_folder in os.listdir(self.base_music_dir):
+                    guild_path = os.path.join(self.base_music_dir, guild_folder)
+                    if os.path.isdir(guild_path):
+                        # Check if directory is empty and guild is not active
+                        if not os.listdir(guild_path) and int(guild_folder) not in self.queues:
+                            try:
+                                os.rmdir(guild_path)
+                                logger.info(f"Removed empty guild directory: {guild_folder}")
+                            except Exception as e:
+                                logger.error(f"Error removing empty guild directory {guild_folder}: {e}")
+
+                await asyncio.sleep(3600)  # Check every hour
+            except Exception as e:
+                logger.error(f"Error in directory cleanup: {e}")
+                await asyncio.sleep(60)
+
+    def get_queue(self, guild_id: int) -> MusicQueue:
+        """Get or create a queue for a guild"""
+        if guild_id not in self.queues:
+            self.queues[guild_id] = MusicQueue()
+        return self.queues[guild_id]
+
+    async def cleanup_files(self, guild_id: int):
+        queue = self.queues.pop(guild_id, None)
+        if not queue:
+            return
+
+        # Cancel progress task if exists
+        if hasattr(queue, 'progress_task') and queue.progress_task:
+            queue.progress_task.cancel()
+            try:
+                await queue.progress_task
+            except asyncio.CancelledError:
+                pass
+
+        # Delete now playing message
+        if queue.now_playing_message:
+            try:
+                await queue.now_playing_message.delete()
+            except Exception as e:
+                logger.error(f"Error removing now playing message: {e}")
+
+        queue.clear()
+
+        # Clean up guild directory if needed
+        if not self.bot.get_guild(guild_id):  # If guild no longer exists
+            await self.cleanup_guild_directory(guild_id)
+
+    async def preload_next_song(self, guild_id: int):
+        """Preload the next song in queue"""
+        queue = self.get_queue(guild_id)
+        if not queue.queue or queue.preloaded_song:
+            return
+
+        next_song = queue.queue[0]
+        try:
+            video_id = next_song.source.get('id')
+            if video_id:
+                cached_file = self.song_cache.get(video_id)
+                if cached_file and os.path.exists(cached_file):
+                    next_song.filename = cached_file
+                    queue.preloaded_song = next_song
+                    return
+
+            guild_dir = self.get_guild_directory(guild_id)
+            ydl_opts = self.ydl_opts.copy()
+            ydl_opts['outtmpl'] = os.path.join(guild_dir, '%(title)s.%(ext)s')
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = await self.bot.loop.run_in_executor(
+                    None,
+                    lambda: ydl.extract_info(next_song.source['webpage_url'], download=True)
+                )
+                filename = ydl.prepare_filename(info).replace('.webm', '.mp3').replace('.m4a', '.mp3')
+                next_song.filename = filename
+                queue.preloaded_song = next_song
+
+                if video_id:
+                    self.song_cache.add(video_id, filename)
+        except Exception as e:
+            logger.error(f"Error preloading next song: {e}")
+
+    def format_duration(self, seconds: float) -> str:
+        """Format duration in seconds to string"""
+        if not seconds:
+            return "00:00"
+
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        seconds = int(seconds % 60)
+
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def get_queue_duration(self, queue: MusicQueue) -> int:
+        """Calculate total duration of queue"""
+        total = 0
+        if queue.current:
+            total += max(0, queue.current.duration - queue.get_song_progress())
+        for song in queue.queue:
+            if song.duration:
+                total += song.duration
+        return total
+
+    def create_progress_bar(self, progress: float, duration: float, length: int = 20) -> str:
+        """Create a text progress bar"""
+        filled = int((progress / duration) * length)
+        bar = '▓' * filled + '░' * (length - filled)
+        timestamp = f"{self.format_duration(int(progress))}/{self.format_duration(int(duration))}"
+        return f"`{bar}` {timestamp}"
+
+    async def update_progress_bar(self, message: discord.Message, queue: MusicQueue):
+        """Update the progress bar periodically"""
+        try:
+            while True:
+                if not queue.current or not message:
+                    return
+
+                if time.time() - queue.last_progress_update < 10:
+                    await asyncio.sleep(10)
+                    continue
+
+                queue.last_progress_update = time.time()
+                progress = queue.get_song_progress()
+                duration = queue.current.duration or 0
+
+                if duration > 0:
+                    progress_bar = self.create_progress_bar(progress, duration)
+                    try:
+                        embed = message.embeds[0]
+                        embed.description = f"**{queue.current.title}**\n{progress_bar}\n볼륨: {int(queue.volume * 100)}%"
+                        await message.edit(embed=embed)
+                    except discord.NotFound:
+                        return
+                    except Exception as e:
+                        logger.error(f"Error updating progress bar: {e}")
+
+                await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            return
+
+    async def periodic_cache_cleanup(self):
+        """Run periodic cache cleanup"""
+        while not self.bot.is_closed():
+            try:
+                self.song_cache.cleanup()
+                await asyncio.sleep(300)  # Every 5 minutes
+            except Exception as e:
+                logger.error(f"Error in cache cleanup: {e}")
+                await asyncio.sleep(60)
+
+    # =============================================================================
+    # Command Group Setup
+    # =============================================================================
+
+    music_group = app_commands.Group(name="곡", description="음악 관련 명령어")
+
+    @music_group.command(name="재생", description="노래를 재생합니다")
+    async def play(self, interaction: discord.Interaction, query: str):
+        """Play a song command implementation"""
+        try:
+            if not interaction.guild:
+                await interaction.response.send_message("서버에서만 사용 가능한 명령어입니다.", ephemeral=True)
+                return
+
+            # Check if bot has necessary permissions
+            if not interaction.guild.voice_client and not interaction.guild.me.guild_permissions.connect:
+                await interaction.response.send_message("음성 채널 연결 권한이 없습니다.", ephemeral=True)
+                return
+
+            if not interaction.user.voice:
+                await interaction.response.send_message("음성 채널에 먼저 입장해주세요.", ephemeral=True)
+                return
+
+            # Check if the music directory exists
+            guild_dir = self.get_guild_directory(interaction.guild.id)
+
+            await interaction.response.defer()
+
+            # Log the query for debugging
+            logger.info(f"Processing play command with query: {query}")
+
+            try:
+                if not query.startswith(('https://', 'http://')):
+                    # Search functionality
+                    logger.info("Performing YouTube search")
+                    with yt_dlp.YoutubeDL(self.search_opts) as ydl:
+                        search_term = f"ytsearch5:{query}"
+                        info = await self.bot.loop.run_in_executor(
+                            None,
+                            lambda: ydl.extract_info(search_term, download=False)
+                        )
+
+                        if not info:
+                            logger.error("No info returned from YouTube search")
+                            await interaction.followup.send("검색 결과를 찾을 수 없습니다.", ephemeral=True)
+                            return
+
+                        if 'entries' not in info:
+                            logger.error(f"Unexpected YouTube search response: {info}")
+                            await interaction.followup.send("검색 결과를 찾을 수 없습니다.", ephemeral=True)
+                            return
+
+                        entries = info.get('entries', [])[:5]
+                        if not entries:
+                            await interaction.followup.send("검색 결과를 찾을 수 없습니다.", ephemeral=True)
+                            return
+
+                        view = SongSelectView(entries)
+                        embed = discord.Embed(
+                            title="🎵 노래 선택",
+                            description="\n".join(f"{i + 1}. {entry['title']}" for i, entry in enumerate(entries))
+                        )
+                        embed.set_footer(text="60초 내에 선택해주세요")
+
+                        msg = await interaction.followup.send(embed=embed, view=view)
+                        view.message = msg
+                        await view.wait()
+
+                        if not view.selected_entry:
+                            return
+
+                        info = view.selected_entry
+                else:
+                    # Direct URL
+                    logger.info("Processing direct URL")
+                    with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
+                        info = await self.bot.loop.run_in_executor(
+                            None,
+                            lambda: ydl.extract_info(query, download=False)
+                        )
+
+                # Download and process the selected song
+                logger.info(f"Downloading song: {info.get('title', 'Unknown')}")
+                video_url = info.get('webpage_url') or info.get('url') or info.get('id')
+                if not video_url:
+                    await interaction.followup.send("유효한 동영상 URL을 찾을 수 없습니다.", ephemeral=True)
+                    return
+
+                guild_dir = self.get_guild_directory(interaction.guild.id)
+                ydl_opts = self.ydl_opts.copy()
+                ydl_opts['outtmpl'] = os.path.join(guild_dir, '%(title)s.%(ext)s')
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    download_info = await self.bot.loop.run_in_executor(
+                        None,
+                        lambda: ydl.extract_info(video_url, download=True)
+                    )
+
+                    if not download_info:
+                        logger.error("Failed to download song info")
+                        await interaction.followup.send("노래 정보를 가져올 수 없습니다.", ephemeral=True)
+                        return
+
+                    filename = ydl.prepare_filename(download_info).replace('.webm', '.mp3').replace('.m4a', '.mp3')
+                    logger.info(f"Prepared filename: {filename}")
+
+                    if not os.path.exists(filename):
+                        logger.error(f"Downloaded file not found: {filename}")
+                        await interaction.followup.send("노래 다운로드에 실패했습니다.", ephemeral=True)
+                        return
+
+                    # Create song object and add to queue
+                    song = Song({
+                        'title': download_info.get('title', 'Unknown Title'),
+                        'thumbnail': download_info.get('thumbnail'),
+                        'duration': download_info.get('duration'),
+                        'filename': filename,
+                        'id': download_info.get('id'),
+                        'webpage_url': download_info.get('webpage_url'),
+                    }, interaction.user)
+
+                    queue = self.get_queue(interaction.guild.id)
+                    queue.queue.append(song)
+                    queue.text_channel = interaction.channel
+
+                    # Connect to voice channel if not already connected
+                    if not interaction.guild.voice_client:
+                        await interaction.user.voice.channel.connect()
+                        await self.play_next(interaction.guild, interaction.channel)
+                    elif not interaction.guild.voice_client.is_playing():
+                        await self.play_next(interaction.guild, interaction.channel)
+
+                    await interaction.followup.send(
+                        f"🎵 **{song.title}** 를 재생목록에 추가했습니다.",
+                        ephemeral=True
+                    )
+
+            except Exception as e:
+                logger.error(f"Error processing song: {str(e)}", exc_info=True)
+                await interaction.followup.send(f"노래 처리 중 오류가 발생했습니다.: {str(e)}", ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"Critical error in play command: {str(e)}", exc_info=True)
+            await interaction.followup.send(f"명령어 처리 중 오류가 발생했습니다: {str(e)}", ephemeral=True)
+
+    async def play_next(self, guild: discord.Guild, text_channel: Optional[discord.TextChannel] = None):
+        if not guild.voice_client:
+            return
+
+        queue = self.get_queue(guild.id)
+        if text_channel:
+            queue.text_channel = text_channel
+
+        # Cancel existing progress task if it exists
+        if hasattr(queue, 'progress_task') and queue.progress_task:
+            queue.progress_task.cancel()
+            try:
+                await queue.progress_task
+            except asyncio.CancelledError:
+                pass
+
+        try:
+            if queue.now_playing_message:
+                try:
+                    await queue.now_playing_message.delete()
                 except discord.NotFound:
                     pass
                 except Exception as e:
-                    logger.error(f"Error in timeout handler: {e}")
-        except Exception as e:
-            logger.error(f"Error in timeout handler: {e}")
+                    logger.error(f"Error deleting now playing message: {e}")
+                queue.now_playing_message = None
 
-    def set_message(self, message):
-        """Set the view's message reference."""
-        self.message = message
+            if queue.current:
+                if queue.loop_mode == 'song':
+                    queue.queue.insert(0, queue.current)
+                elif queue.loop_mode == 'queue':
+                    queue.queue.append(queue.current)
 
-
-class MusicControlView(View):
-    def __init__(self, player: 'MusicPlayer', music_cog: 'MusicCog'):
-        super().__init__(timeout=None)
-        self.player = player
-        self.music_cog = music_cog
-        self._update_button_states()
-
-    def _update_button_states(self) -> None:
-        """Update button states based on player state."""
-        is_playing = bool(self.player.voice_client and self.player.voice_client.is_playing())
-        is_paused = bool(self.player.voice_client and self.player.voice_client.is_paused())
-        has_queue = bool(self.player.queue)
-
-        for child in self.children:
-            if isinstance(child, Button):
-                self._update_button(child, is_playing, is_paused, has_queue)
-
-    def _update_button(self, button: Button, is_playing: bool, is_paused: bool, has_queue: bool):
-        """Update individual button state."""
-        if button.custom_id == "pause":
-            button.disabled = not is_playing
-        elif button.custom_id == "resume":
-            button.disabled = not is_paused
-        elif button.custom_id == "skip":
-            button.disabled = not is_playing and not has_queue
-        elif button.custom_id == "stop":
-            button.disabled = not (is_playing or is_paused or has_queue)
-        elif button.custom_id == "shuffle":
-            button.disabled = len(self.player.queue) < 2
-
-    async def _handle_interaction(self, interaction: Interaction, action: str, handler: callable) -> None:
-        """Generic interaction handler with error handling."""
-        if not await self._validate_user(interaction):
-            return
-
-        try:
-            await handler()
-            self._update_button_states()
-            await self._update_view(interaction)
-        except Exception as e:
-            logger.error(f"Error in {action}: {e}")
-            await interaction.response.send_message(
-                f"{action} 처리 중 오류가 발생했습니다.",
-                ephemeral=True
-            )
-
-    async def _validate_user(self, interaction: Interaction) -> bool:
-        """Validate user's voice state."""
-        if not interaction.user.voice or interaction.user.voice.channel != self.player.voice_client.channel:
-            await interaction.response.send_message(
-                "이 명령어를 사용하려면 음성 채널에 참가해야 합니다.",
-                ephemeral=True
-            )
-            return False
-        return True
-
-    async def _update_view(self, interaction: Interaction):
-        """Update view in response."""
-        if interaction.response.is_done():
-            await interaction.edit_original_response(view=self)
-        else:
-            await interaction.response.edit_message(view=self)
-
-    # Button Definitions
-    @discord.ui.button(label="⏸️", style=discord.ButtonStyle.secondary, custom_id="pause")
-    async def pause(self, interaction: Interaction, button: Button):
-        async def pause_handler():
-            if self.player.voice_client.is_playing():
-                self.player.voice_client.pause()
-                button.style = discord.ButtonStyle.primary
-                button.label = "▶️"
-                await interaction.response.send_message("재생을 일시정지했습니다.", ephemeral=True)
-
-        await self._handle_interaction(interaction, "일시정지", pause_handler)
-
-    @discord.ui.button(label="▶️", style=discord.ButtonStyle.secondary, custom_id="resume", row=0)
-    async def resume(self, interaction: Interaction, button: Button):
-        async def resume_handler():
-            if self.player.voice_client.is_paused():
-                self.player.voice_client.resume()
-                for child in self.children:
-                    if child.custom_id == "pause":
-                        child.style = discord.ButtonStyle.secondary
-                        child.label = "⏸️"
-                await interaction.response.send_message("재생을 재개했습니다.", ephemeral=True)
-
-        await self._handle_interaction(interaction, "재개", resume_handler)
-
-    @discord.ui.button(label="⏭️", style=discord.ButtonStyle.secondary, custom_id="skip", row=0)
-    async def skip(self, interaction: Interaction, button: Button):
-        async def skip_handler():
-            if self.player.voice_client.is_playing():
-                self.player.voice_client.stop()
-                await interaction.response.send_message("현재 곡을 건너뜁니다.", ephemeral=True)
-
-        await self._handle_interaction(interaction, "건너뛰기", skip_handler)
-
-    @discord.ui.button(label="🔄", style=discord.ButtonStyle.secondary, custom_id="loop", row=1)
-    async def toggle_loop(self, interaction: Interaction, button: Button):
-        async def loop_handler():
-            if not self.player.current and not self.player.queue:
-                await interaction.response.send_message(
-                    "재생 중인 곡이 없어 반복 모드를 설정할 수 없습니다.",
-                    ephemeral=True
-                )
+            if not queue.queue:
+                await self.cleanup_files(guild.id)
+                await guild.voice_client.disconnect()
                 return
 
-            self.player.loop = not self.player.loop
-            button.style = discord.ButtonStyle.primary if self.player.loop else discord.ButtonStyle.secondary
-            button.label = "🔄 (반복)" if self.player.loop else "🔄"
+            queue.current = queue.queue.pop(0)
+            queue.start_time = time.time()
+            queue.last_progress_update = time.time()
 
-            if self.player.current:
-                await self.player.update_now_playing()
+            def after_playing(error):
+                if error:
+                    logger.error(f"Error playing song: {error}")
 
-        await self._handle_interaction(interaction, "반복 모드", loop_handler)
-
-    @discord.ui.button(label="⏹️", style=discord.ButtonStyle.danger, custom_id="stop", row=1)
-    async def stop(self, interaction: Interaction, button: Button):
-        async def stop_handler():
-            self.player.loop = False
-            await self.player.cleanup()
-            self.music_cog.players.pop(interaction.guild.id, None)
-            await interaction.response.send_message("재생을 멈추고 대기열을 비웠습니다.", ephemeral=True)
-
-        await self._handle_interaction(interaction, "정지", stop_handler)
-
-    @discord.ui.button(label="🔀", style=discord.ButtonStyle.secondary, custom_id="shuffle", row=1)
-    async def shuffle(self, interaction: Interaction, button: Button):
-        async def shuffle_handler():
-            if len(self.player.queue) < 2:
-                await interaction.response.send_message("대기열에 곡이 충분하지 않습니다.", ephemeral=True)
-                return
-
-            random.shuffle(self.player.queue)
-            await interaction.response.send_message("대기열을 섞었습니다.", ephemeral=True)
-            await self.player.update_now_playing()
-
-        await self._handle_interaction(interaction, "셔플", shuffle_handler)
-
-
-# Part 5A: Music Player Core Class
-
-class MusicPlayer:
-    def __init__(self, bot, guild, channel, music_cog, music_dir, cache_manager):
-        self.bot = bot
-        self.guild = guild
-        self.channel = channel
-        self.music_cog = music_cog
-        self.music_dir = music_dir
-        self.cache_manager = cache_manager
-        self.queue = deque()  # Removed maxlen limit
-        self.voice_client = None
-        self.current = None
-        self.loop = False
-        self.embed_message = None
-        self._volume = DEFAULT_VOLUME
-        self.control_view = None
-        self.check_task = self.bot.loop.create_task(self.check_voice_channel())
-        self.default_thumbnail = 'https://cdn.discordapp.com/attachments/1134007524320870451/default_music.png'
-        self.messages_to_clean = set()
-        self.is_playing = False
-        self.download_queue = DownloadQueue()
-        self.queue_lock = asyncio.Lock()
-        # Task management
-        self.tasks = []
-        self.start_tasks()
-
-        self._volume_file = os.path.join(music_dir, "volume.json")
-        self._volume = self._load_volume()
-
-        self.error_count = 0
-        self.max_errors = 3
-        self.last_error_time = None
-        self.error_reset_interval = 300  # 5 minutes
-
-    def _load_volume(self) -> float:
-        """Load saved volume or return default."""
-        try:
-            if os.path.exists(self._volume_file):
-                with open(self._volume_file, 'r') as f:
-                    data = json.load(f)
-                    return float(data.get('volume', DEFAULT_VOLUME))
-        except Exception as e:
-            logger.error(f"Error loading volume: {e}")
-        return DEFAULT_VOLUME
-
-    async def set_volume(self, volume: float):
-        """Set and save volume with directory check."""
-        self._volume = volume
-        try:
-            volume_dir = os.path.dirname(self._volume_file)
-            os.makedirs(volume_dir, exist_ok=True)
-            with open(self._volume_file, 'w') as f:
-                json.dump({'volume': volume}, f)
-        except Exception as e:
-            logger.error(f"Error saving volume: {e}")
-
-    def start_tasks(self):
-        """Start background tasks with proper error handling."""
-        # Voice channel monitoring
-        check_task = self.bot.loop.create_task(self.check_voice_channel())
-        check_task.add_done_callback(self.task_error_handler)
-        self.tasks.append(check_task)
-
-    def task_error_handler(self, task):
-        """Handle task completion and errors."""
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"Task error: {e}")
-            # Restart the task if it wasn't intentionally cancelled
-            if not task.cancelled():
-                new_task = self.bot.loop.create_task(task.get_coro())
-                new_task.add_done_callback(self.task_error_handler)
-                self.tasks.append(new_task)
-
-    async def handle_error(self, error: Exception):
-        """Handle errors with automatic recovery."""
-        current_time = datetime.now()
-
-        # Reset error count if enough time has passed
-        if (self.last_error_time and
-                (current_time - self.last_error_time).total_seconds() > self.error_reset_interval):
-            self.error_count = 0
-
-        self.last_error_time = current_time
-        self.error_count += 1
-
-        logger.error(f"Playback error: {error}")
-
-        if self.error_count >= self.max_errors:
-            await self.handle_critical_error()
-        else:
-            # Try to recover
-            await self.attempt_recovery()
-
-    async def attempt_recovery(self):
-        """Attempt to recover from errors."""
-        try:
-            logger.info("Attempting playback recovery")
-
-            # Disconnect and reconnect voice client
-            if self.voice_client:
-                try:
-                    await self.voice_client.disconnect()
-                except:
-                    pass
-
-            if not await self.connect_to_voice(self.voice_client.channel):
-                logger.error("Failed to reconnect voice client")
-                return
-
-            # Try to resume playback
-            if self.current:
-                await self.play_next()
-
-        except Exception as e:
-            logger.error(f"Recovery attempt failed: {e}")
-
-    async def handle_critical_error(self):
-        """Handle critical errors by restarting the player."""
-        try:
-            logger.warning("Handling critical error - restarting player")
-            await self.cleanup()
-
-            # Notify users
-            error_embed = discord.Embed(
-                title="⚠️ 오류 발생",
-                description="음악 재생 중 오류가 발생하여 재시작합니다.",
-                color=discord.Color.red()
-            )
-            await self.channel.send(embed=error_embed)
-
-            # Reset state
-            self.error_count = 0
-            self.last_error_time = None
-
-            # Restart tasks
-            self.start_tasks()
-
-        except Exception as e:
-            logger.error(f"Failed to handle critical error: {e}")
-
-    # Add this to MusicPlayer class
-    async def connect_to_voice(self, voice_channel: discord.VoiceChannel) -> bool:
-        """Connect to a voice channel with improved error handling."""
-        try:
-            if self.voice_client:
-                if self.voice_client.is_connected():
-                    if self.voice_client.channel != voice_channel:
-                        await self.voice_client.move_to(voice_channel)
-                    return True
-                else:
+                async def cleanup():
+                    await asyncio.sleep(1)
                     try:
-                        await self.voice_client.disconnect()
-                    except:
-                        pass
-                    self.voice_client = None
+                        if queue.current and os.path.exists(queue.current.filename):
+                            for attempt in range(3):
+                                try:
+                                    os.remove(queue.current.filename)
+                                    logger.info(f"Removed finished song file: {queue.current.filename}")
+                                    break
+                                except Exception:
+                                    if attempt < 2:
+                                        await asyncio.sleep(1)
+                    except Exception as e:
+                        logger.error(f"Error removing finished song file: {e}")
 
-            # Add delay before connecting to avoid rate limits
-            await asyncio.sleep(0.5)
-            self.voice_client = await voice_channel.connect(
-                timeout=10.0,
-                reconnect=True,
-                self_deaf=True  # Add this to reduce CPU usage
-            )
+                asyncio.run_coroutine_threadsafe(cleanup(), self.bot.loop)
+                asyncio.run_coroutine_threadsafe(self.play_next(guild), self.bot.loop)
 
-            # Set up reconnection handler
-            self.voice_client._player = self
-            self.voice_client.on_disconnect = self.handle_disconnect
-
-            return True
-        except Exception as e:
-            logger.error(f"Voice connection error: {e}")
-            return False
-
-    async def cleanup(self):
-        """Clean up resources and reset player state with improved cleanup."""
-        try:
-            logger.debug("MusicPlayer.cleanup called")
-
-            for task in self.tasks:
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-            self.tasks.clear()
-
-            # Stop playback and disconnect
-            if self.voice_client:
-                if self.voice_client.is_playing():
-                    self.voice_client.stop()
-                await self.voice_client.disconnect()
-                self.voice_client = None
-
-            # Clean up current song file
-            if self.current and 'file_path' in self.current:
-                await self.cleanup_file(self.current['file_path'])
-                # Clean up any partial downloads
-                await YTDLSource.cleanup_partial_downloads(
-                    self.music_dir,
-                    self.current.get('song_id', '')
-                )
-
-            # Clean up download queue
-            if hasattr(self, 'download_queue'):
-                try:
-                    while not self.download_queue.queue.empty():
-                        song_id, _, _ = await self.download_queue.queue.get()
-                        await YTDLSource.cleanup_partial_downloads(self.music_dir, song_id)
-                except Exception as e:
-                    logger.error(f"Error cleaning download queue: {e}")
-
-            # Clean up embedded message
-            await self.cleanup_embed_message()
-
-            # Reset control view
-            await self.reset_control_view()
-
-            # Cancel check task
-            if self.check_task:
-                self.check_task.cancel()
-
-            # Clean up remaining files
-            await self.cleanup_music_directory()
-
-            # Reset player state
-            self.queue.clear()
-            self.current = None
-            self.loop = False
-            self._volume = DEFAULT_VOLUME
-            self.is_playing = False
-
-            logger.debug("MusicPlayer.cleanup completed")
-        except Exception as e:
-            logger.exception(f"Cleanup error: {e}")
-
-    async def cleanup_file(self, file_path: str, max_retries: int = 5) -> None:
-        """Clean up a single file with improved retry logic."""
-        if not file_path or not os.path.exists(file_path):
-            return
-
-        if self.current and self.current.get('file_path') == file_path:
-            return
-
-        for attempt in range(max_retries):
             try:
-                os.remove(file_path)
-                logger.debug(f"Deleted file: {file_path}")
-                break
-            except PermissionError:
+                ffmpeg_options = {
+                    'options': '-vn',
+                    'executable': r'C:\Users\luvwl\ffmpeg\bin\ffmpeg.exe'
+                }
+
+                logger.info(f"Playing file: {queue.current.filename}")
+
+                source = discord.PCMVolumeTransformer(
+                    discord.FFmpegPCMAudio(
+                        queue.current.filename,
+                        **ffmpeg_options
+                    ),
+                    volume=queue.volume
+                )
+
+                guild.voice_client.play(source, after=after_playing)
+
+                progress_bar = ""
+                if queue.current.duration:
+                    progress_bar = f"\n{self.create_progress_bar(0, queue.current.duration)}"
+
+                embed = discord.Embed(
+                    title="🎵 현재 재생 중",
+                    description=f"**{queue.current.title}**{progress_bar}\n볼륨: {int(queue.volume * 10)}",
+                    color=discord.Color.blue()
+                )
+                if queue.current.thumbnail:
+                    embed.set_thumbnail(url=queue.current.thumbnail)
+
+                loop_modes = {'none': '', 'song': ' | 🔂 한곡 반복', 'queue': ' | 🔁 전체 반복'}
+                embed.set_footer(text=f"요청자: {queue.current.requester.display_name}{loop_modes[queue.loop_mode]}")
+
+                channel_to_use = queue.text_channel or guild.text_channels[0]
+                view = PlayerControlsView(self)
+                queue.now_playing_message = await channel_to_use.send(embed=embed, view=view)
+
+                if queue.current.duration:
+                    queue.progress_task = self.bot.loop.create_task(
+                        self.update_progress_bar(queue.now_playing_message, queue)
+                    )
+
+                await self.preload_next_song(guild.id)
+
+            except Exception as e:
+                logger.error(f"Error setting up playback: {e}")
                 await asyncio.sleep(1)
-            except FileNotFoundError:
-                break
-            except Exception as e:
-                logger.error(f"Error deleting file {file_path}: {e}")
-                if attempt == max_retries - 1:
-                    raise
+                await self.play_next(guild)
 
-    async def cleanup_embed_message(self):
-        """Clean up the embedded message."""
-        if self.embed_message:
+        except Exception as e:
+            logger.error(f"Critical error in play_next: {e}")
             try:
-                await self.embed_message.delete()
+                await self.cleanup_files(guild.id)
+                if guild.voice_client:
+                    await guild.voice_client.disconnect()
+            except Exception as cleanup_error:
+                logger.error(f"Error during cleanup after critical error: {cleanup_error}")
+
+    @music_group.command(name="스킵", description="현재 재생 중인 노래를 건너뜁니다")
+    async def skip(self, interaction: discord.Interaction):
+        if not interaction.guild.voice_client or not interaction.guild.voice_client.is_playing():
+            await interaction.response.send_message("현재 재생 중인 노래가 없습니다.", ephemeral=True)
+            return
+
+        queue = self.get_queue(interaction.guild.id)
+        current_song = queue.current
+
+        queue.text_channel = interaction.channel
+        interaction.guild.voice_client.stop()
+
+        if current_song:
+            try:
+                if os.path.exists(current_song.filename):
+                    os.remove(current_song.filename)
+                    logger.info(f"Removed skipped song file: {current_song.filename}")
             except Exception as e:
-                logger.error(f"Failed to delete embed message: {e}")
-            finally:
-                self.embed_message = None
+                logger.error(f"Error removing skipped song file: {e}")
 
-    async def reset_control_view(self):
-        """Reset control view state."""
-        if self.control_view:
-            for child in self.control_view.children:
-                if child.custom_id == "loop":
-                    child.style = discord.ButtonStyle.secondary
-                    child.label = "🔄"
-                elif child.custom_id == "pause":
-                    child.style = discord.ButtonStyle.secondary
-                    child.label = "⏸️"
-            self.control_view = None
+        await interaction.response.send_message("⏭️ 노래를 건너뛰었습니다.", ephemeral=True)
 
-    async def cleanup_music_directory(self):
-        """Clean up the music directory."""
+    @music_group.command(name="정지", description="재생을 멈추고 대기열을 초기화합니다")
+    async def stop(self, interaction: discord.Interaction):
+        if not interaction.guild.voice_client:
+            await interaction.response.send_message("봇이 음성 채널에 없습니다.", ephemeral=True)
+            return
+
         try:
-            for file in os.listdir(self.music_dir):
-                file_path = os.path.join(self.music_dir, file)
-                await self.cleanup_file(file_path)
+            await interaction.response.send_message("⏹️ 재생을 멈추고 대기열을 초기화했습니다.", ephemeral=True)
+
+            if interaction.guild.voice_client.is_playing():
+                interaction.guild.voice_client.stop()
+
+            await self.cleanup_files(interaction.guild.id)
+            await interaction.guild.voice_client.disconnect()
+
         except Exception as e:
-            logger.error(f"Error cleaning up music directory: {e}")
+            logger.error(f"Error in stop command: {e}")
 
-    # Add to MusicPlayer class
-    async def check_voice_channel(self):
-        """Monitor voice channel status."""
-        try:
-            await self.bot.wait_until_ready()
+    @music_group.command(name="일시정지", description="현재 재생 중인 노래를 일시정지합니다")
+    async def pause(self, interaction: discord.Interaction):
+        if not interaction.guild.voice_client:
+            await interaction.response.send_message("봇이 음성 채널에 없습니다.", ephemeral=True)
+            return
 
-            while not self.bot.is_closed():
-                try:
-                    if self.voice_client:
-                        # Check if bot is alone
-                        if len(self.voice_client.channel.members) <= 1:
-                            await self.cleanup_and_disconnect()
-                            break
+        if not interaction.guild.voice_client.is_playing():
+            await interaction.response.send_message("현재 재생 중인 노래가 없습니다.", ephemeral=True)
+            return
 
-                        # Check connection health
-                        if not self.voice_client.is_connected():
-                            logger.warning("Voice client disconnected, attempting to reconnect")
-                            await self.handle_disconnect()
+        if interaction.guild.voice_client.is_paused():
+            await interaction.response.send_message("이미 일시정지되어 있습니다.", ephemeral=True)
+            return
 
-                        # Check for hanging playback
-                        if self.voice_client.is_playing() and not self.current:
-                            logger.warning("Inconsistent playback state detected")
-                            self.voice_client.stop()
-                            await self.play_next()
+        interaction.guild.voice_client.pause()
+        await interaction.response.send_message("⏸️ 일시정지되었습니다.", ephemeral=True)
 
-                    await asyncio.sleep(10)  # Check every 10 seconds
+    @music_group.command(name="다시재생", description="일시정지된 노래를 다시 재생합니다")
+    async def resume(self, interaction: discord.Interaction):
+        if not interaction.guild.voice_client:
+            await interaction.response.send_message("봇이 음성 채널에 없습니다.", ephemeral=True)
+            return
 
-                except Exception as e:
-                    logger.error(f"Error in voice channel check: {e}")
-                    await asyncio.sleep(5)
+        if not interaction.guild.voice_client.is_paused():
+            await interaction.response.send_message("일시정지된 노래가 없습니다.", ephemeral=True)
+            return
 
-        except asyncio.CancelledError:
-            logger.debug("Voice channel check task cancelled")
-        except Exception as e:
-            logger.error(f"Fatal error in voice channel check: {e}")
+        interaction.guild.voice_client.resume()
+        await interaction.response.send_message("▶️ 다시 재생합니다.", ephemeral=True)
 
-    async def cleanup_and_disconnect(self):
-        """Clean up messages and disconnect."""
-        try:
-            logger.debug("MusicPlayer.cleanup_and_disconnect called")
+    @music_group.command(name="볼륨", description="볼륨을 조절합니다 (1-10, 기본값: 5)")
+    async def volume(self, interaction: discord.Interaction, volume: app_commands.Range[int, 1, 10]):
+        queue = self.get_queue(interaction.guild.id)
+        queue.volume = volume / 10.0  # Convert to a percentage (0.0 to 1.0)
 
-            # Clean up messages
-            for message_id in self.messages_to_clean:
-                try:
-                    message = await self.channel.fetch_message(message_id)
-                    await message.delete()
-                except Exception as e:
-                    logger.error(f"Failed to delete message ID {message_id}: {e}")
+        if interaction.guild.voice_client and interaction.guild.voice_client.source:
+            interaction.guild.voice_client.source.volume = queue.volume
 
-            self.messages_to_clean.clear()
-            await self.cleanup()
+        await interaction.response.send_message(f"🔊 볼륨을 {int(queue.volume * 10)}로 설정했습니다.", ephemeral=True)
 
-            logger.debug("MusicPlayer.cleanup_and_disconnect completed")
-        except Exception as e:
-            logger.exception(f"Cleanup and disconnect error: {e}")
+        if queue.now_playing_message:
+            try:
+                embed = queue.now_playing_message.embeds[0]
+                progress_bar = self.create_progress_bar(queue.get_song_progress(), queue.current.duration)
+                embed.description = f"**{queue.current.title}**\n{progress_bar}\n볼륨: {int(queue.volume * 10)}"
+                await queue.now_playing_message.edit(embed=embed)
+            except Exception as e:
+                logger.error(f"Error updating now playing message volume: {e}")
 
-    # Part 5B: Music Player Playback Functions
+    @music_group.command(name="대기열", description="대기열에 있는 노래 목록을 보여줍니다")
+    async def queue(self, interaction: discord.Interaction):
+        queue = self.get_queue(interaction.guild.id)
 
-    # Continue MusicPlayer class...
-    async def add_to_queue(self, song_data: Dict[str, Any], song_id: str) -> None:
-        async with self.queue_lock:
-            """Add a song to the queue."""
-            song_entry = await self.cache_manager.get(song_id)
-            if song_entry:
-                if song_entry.is_downloading:
-                    logger.info(f"Already downloading: {song_entry.title}")
-                else:
-                    logger.info(f"Already downloaded: {song_entry.title}")
-            else:
-                song_entry = SongData(
-                    title=song_data.get('title'),
-                    url=song_data.get('webpage_url'),
-                    thumbnail=song_data.get('thumbnail', ''),
-                    duration=song_data.get('duration', 0),
-                    is_downloading=True
-                )
-                await self.cache_manager.set(song_id, song_entry)
-                song_entry.download_future = asyncio.create_task(
-                    self.download_song(song_id, song_data))
+        if not queue.current and not queue.queue:
+            await interaction.response.send_message("대기열이 비어있습니다.", ephemeral=True)
+            return
 
-            self.queue.append(song_id)
-            await self.update_controls()
+        embed = discord.Embed(title="🎵 재생 대기열", color=discord.Color.blue())
 
-    async def download_song(self, song_id: str, song_data: dict):
-        """Download a song with error handling."""
-        try:
-            logger.debug(f"Queuing song download: song_id={song_id}")
-            await self.bot.loop.create_task(self._download_song(song_id, song_data))
-        except Exception as e:
-            logger.exception(f"Error queuing download for {song_data.get('title')}: {e}")
-            if song_id in self.queue:
-                self.queue.remove(song_id)
-            await self.cache_manager.remove(song_id)
-            await self.update_now_playing()
-
-    async def _download_song(self, song_id: str, song_data: dict):
-        """Perform the actual song download in a separate task."""
-        try:
-            logger.debug(f"Downloading song: song_id={song_id}")
-            song_info, file_path = await YTDLSource.download_song(
-                song_id, song_data['url'], self.music_dir, self.bot.loop
+        if queue.current:
+            progress = queue.get_song_progress()
+            duration = queue.current.duration or 0
+            time_info = (
+                f"\n⏰ {self.format_duration(int(progress))}/{self.format_duration(duration)}"
+                if duration else ""
             )
-
-            song_entry = await self.cache_manager.get(song_id)
-            if song_entry:
-                song_entry.file_path = file_path
-                song_entry.is_downloading = False
-                await self.cache_manager.set(song_id, song_entry)
-
-            logger.debug(f"Download completed: song_id={song_id}")
-        except Exception as e:
-            logger.exception(f"Download failed for {song_data.get('title')}: {e}")
-            if song_id in self.queue:
-                self.queue.remove(song_id)
-            await self.cache_manager.remove(song_id)
-            await self.update_now_playing()
-
-    async def update_controls(self):
-        """Update control view state."""
-        if self.control_view:
-            self.control_view._update_button_states()
-            if self.embed_message:
-                try:
-                    await self.embed_message.edit(view=self.control_view)
-                except Exception as e:
-                    logger.error(f"Error updating control view: {e}")
-
-    async def update_now_playing(self) -> None:
-        """Update the now playing embed message."""
-        try:
-            logger.debug("Updating now playing message")
-            await self.cleanup_embed_message()
-
-            embed = await self.create_now_playing_embed()
-
-            if not self.control_view:
-                self.control_view = MusicControlView(self, self.music_cog)
-
-            try:
-                self.embed_message = await self.channel.send(embed=embed, view=self.control_view)
-                self.messages_to_clean.add(self.embed_message.id)
-            except discord.HTTPException:
-                embed.set_thumbnail(url=None)
-                self.embed_message = await self.channel.send(embed=embed, view=self.control_view)
-                self.messages_to_clean.add(self.embed_message.id)
-
-        except Exception as e:
-            logger.exception(f"Update now playing error: {e}")
-
-    async def create_now_playing_embed(self) -> discord.Embed:
-        embed = discord.Embed(color=discord.Color.blue())
-
-        # In create_now_playing_embed
-        thumbnail_url = self.current.get('thumbnail')
-        if thumbnail_url and is_url(thumbnail_url):
-            try:
-                embed.set_thumbnail(url=thumbnail_url)
-            except Exception:
-                # Fallback to default thumbnail
-                if is_url(self.default_thumbnail):
-                    embed.set_thumbnail(url=self.default_thumbnail)
-        elif is_url(self.default_thumbnail):
-            embed.set_thumbnail(url=self.default_thumbnail)
-
-        if not self.current:
-            embed.title = "🎵 현재 재생 중인 곡 없음"
-            embed.description = "현재 재생 중인 곡이 없습니다."
-            embed.color = discord.Color.red()
-        else:
-            embed.title = "🎵 현재 재생 중"
-            duration = format_duration(self.current.get('duration', 0))
-            current_volume = int(self._volume * 100)
-
-            queue_position = f"대기열: {len(self.queue)}곡" if self.queue else "대기열 없음"
-
             embed.add_field(
-                name="곡 정보",
-                value=f"**{self.current['title']}**\n⏱️ {duration}\n🔊 볼륨: {current_volume}%\n📋 {queue_position}",
+                name="현재 재생 중",
+                value=f"**{queue.current.title}** (요청: {queue.current.requester.display_name}){time_info}",
                 inline=False
             )
 
-            if self.loop:
-                embed.add_field(name="반복 모드", value="🔄 활성화", inline=False)
+        if queue.queue:
+            queue_slice = queue.queue[:10]
+            accumulated_time = queue.current.duration - queue.get_song_progress() if queue.current else 0
 
-            # Add progress bar
-            if self.voice_client and self.voice_client.is_playing():
-                total_seconds = self.current.get('duration', 0)
-                if total_seconds > 0:
-                    try:
-                        # Use audio position to calculate progress
-                        audio_position = getattr(self.voice_client, '_player', None)
-                        if audio_position:
-                            position_seconds = int((audio_position.loops * audio_position.frame_length) / 48000)
-                            position_seconds = min(position_seconds, total_seconds)
+            description = []
+            for i, song in enumerate(queue_slice, start=1):
+                time_info = f"⏰ 예상 대기시간: {self.format_duration(int(accumulated_time))}"
+                description.append(
+                    f"{i}. **{song.title}** (요청: {song.requester.display_name})\n   {time_info}"
+                )
+                accumulated_time += song.duration or 0
 
-                            progress = "▬" * 20
-                            progress_position = int(20 * (position_seconds / total_seconds))
-                            progress = progress[:progress_position] + "🔘" + progress[progress_position + 1:]
+            embed.add_field(
+                name=f"대기 중인 노래 (총 {len(queue.queue)}곡)",
+                value="\n".join(description),
+                inline=False
+            )
 
-                            current_time = format_duration(position_seconds)
-                            total_time = format_duration(total_seconds)
-                            progress_text = f"{current_time} {progress} {total_time}"
+            total_duration = int(self.get_queue_duration(queue))
+            embed.set_footer(text=f"총 재생시간: {self.format_duration(total_duration)}")
 
-                            embed.add_field(name="진행 상태", value=progress_text, inline=False)
-                    except Exception as e:
-                        logger.error(f"Error creating progress bar: {e}")
-                        progress = "▬" * 20 + " [재생 중]"
-                        embed.add_field(name="진행 상태", value=progress, inline=False)
+        view = QueueControlsView(self, self.format_duration)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-        return embed
+    @music_group.command(name="삭제", description="대기열에서 특정 노래를 제거합니다")
+    async def remove(self, interaction: discord.Interaction, number: int):
+        try:
+            queue = self.get_queue(interaction.guild.id)
 
-    async def get_next_song_info(self) -> Optional[Dict[str, Union[str, int]]]:
-        """Get information about the next song in queue."""
-        if not self.queue:
-            return None
+            if not 1 <= number <= len(queue.queue):
+                await interaction.response.send_message("올바른 대기열 번호를 입력해주세요.", ephemeral=True)
+                return
 
-        next_song_id = self.queue[0]
-        next_song_entry = await self.cache_manager.get(next_song_id)
-        if next_song_entry:
-            return {
-                'title': next_song_entry.title,
-                'duration': next_song_entry.duration
-            }
-        return None
-
-    async def play_next(self) -> bool:
-        async with self.queue_lock:
-            """Play the next song in queue."""
+            removed_song = queue.queue.pop(number - 1)
             try:
-                logger.debug("Playing next song")
-                await self.cleanup_embed_message()
-
-                # Handle loop functionality
-                if self.loop and self.current:
-                    current_song_id = self.current['song_id']
-                    if current_song_id not in self.queue:
-                        self.queue.appendleft(current_song_id)
-                        logger.debug(f"Loop mode: Added current song back to queue")
-
-                if not self.queue:
-                    self.current = None
-                    await self.update_now_playing()
-                    return False
-
-                # Get next song
-                song_id = self.queue[0]  # Peek at next song without removing
-                song_entry = await self.cache_manager.get(song_id)
-
-                if not song_entry:
-                    logger.error(f"Song ID {song_id} not found in cache")
-                    self.queue.popleft()  # Remove invalid song
-                    return await self.play_next()
-
-                # Wait for download if needed
-                if song_entry.is_downloading:
-                    try:
-                        await asyncio.wait_for(song_entry.download_future, timeout=30)
-                    except asyncio.TimeoutError:
-                        logger.error(f"Download timeout for {song_entry.title}")
-                        self.queue.popleft()
-                        return await self.play_next()
-
-                # Verify file exists
-                if not song_entry.file_path or not os.path.exists(song_entry.file_path):
-                    logger.error(f"File not found for {song_entry.title}")
-                    self.queue.popleft()
-                    return await self.play_next()
-
-                # Create audio source
-                audio_source = discord.FFmpegPCMAudio(song_entry.file_path, **ffmpeg_options)
-                transformed_source = PCMVolumeTransformer(audio_source, volume=self._volume)
-
-                # Start playback
-                if self.voice_client and self.voice_client.is_connected():
-                    self.queue.popleft()  # Remove song from queue only after everything is ready
-                    self.voice_client.play(
-                        transformed_source,
-                        after=lambda e: asyncio.run_coroutine_threadsafe(
-                            self.handle_playback_finished(e), self.bot.loop
-                        )
-                    )
-
-                    self.current = {
-                        'title': song_entry.title,
-                        'duration': song_entry.duration,
-                        'thumbnail': song_entry.thumbnail,
-                        'file_path': song_entry.file_path,
-                        'song_id': song_id
-                    }
-
-                    await self.update_now_playing()
-                    logger.info(f"Now playing: {song_entry.title}")
-                    return True
-                else:
-                    logger.error("Voice client is not connected")
-                    return False
-
+                os.remove(removed_song.filename)
             except Exception as e:
-                logger.exception(f"Error in play_next: {e}")
-                return False
+                logger.error(f"Error removing song file: {e}")
 
-    async def handle_playback_finished(self, error):
-        """Handle playback finished event."""
-        if error:
-            logger.error(f"Error during playback: {error}")
-        try:
-            await self.play_next()
-        except Exception as e:
-            logger.exception(f"Error in handle_playback_finished: {e}")
-
-    def create_current_song_info(self, song_entry: SongData) -> dict:
-        """Create current song info dictionary."""
-        return {
-            'title': song_entry.title,
-            'duration': song_entry.duration,
-            'thumbnail': song_entry.thumbnail,
-            'file_path': song_entry.file_path,
-            'song_id': song_entry.song_id if hasattr(song_entry, 'song_id') else None
-        }
-
-    # Add to MusicPlayer class
-    async def handle_disconnect(self):
-        """Handle voice client disconnection with reconnection attempts."""
-        try:
-            logger.warning("Voice client disconnected")
-
-            if not self.voice_client or not hasattr(self.voice_client, 'channel'):
-                return
-
-            channel = self.voice_client.channel
-
-            # Try to reconnect
-            for attempt in range(3):
-                try:
-                    logger.info(f"Attempting to reconnect (attempt {attempt + 1}/3)")
-                    await asyncio.sleep(1 * (attempt + 1))  # Increasing delay between attempts
-
-                    self.voice_client = await channel.connect(
-                        timeout=10.0,
-                        reconnect=True,
-                        self_deaf=True
-                    )
-
-                    # Restore playback if successful
-                    if self.current:
-                        await self.play_next()
-
-                    logger.info("Successfully reconnected")
-                    return
-
-                except Exception as e:
-                    logger.error(f"Reconnection attempt {attempt + 1} failed: {e}")
-
-            # If all reconnection attempts fail, cleanup
-            logger.error("All reconnection attempts failed")
-            await self.cleanup()
-
-        except Exception as e:
-            logger.error(f"Error in disconnect handler: {e}")
-            await self.cleanup()
-
-
-# Part 6: Music Cog Class
-
-@app_commands.guild_only()
-class MusicCog(commands.Cog, name="Music"):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-        self.base_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cogs_data", "music_cog")
-        os.makedirs(self.base_path, exist_ok=True)
-        self.players = {}
-        self.cache_manager = CacheManager()
-        self.cache_manager.start_cleanup_task(self.bot.loop)
-        self.voice_connection_pool = VoiceConnectionPool()
-
-        self.cache_manager = CacheManager()
-        self.cache_manager.start_cleanup_task(self.bot.loop)
-
-    async def cog_unload(self):
-        """Clean up when the cog is unloaded."""
-        self.cache_manager.stop_cleanup_task()
-        for player in self.players.values():
-            await player.cleanup()
-
-    song = app_commands.Group(name="곡", description="음악 관련 명령어")
-
-    def get_player(self, guild: discord.Guild, channel: discord.TextChannel) -> MusicPlayer:
-        """Get or create a music player for a guild."""
-        if guild.id not in self.players:
-            guild_path = os.path.join(self.base_path, str(guild.id))
-            os.makedirs(guild_path, exist_ok=True)
-            self.players[guild.id] = MusicPlayer(
-                self.bot, guild, channel, self,
-                guild_path,
-                self.cache_manager
-            )
-            logger.debug(f"Created new MusicPlayer: guild_id={guild.id}")
-        return self.players[guild.id]
-
-    @song.command(name="재생", description="노래를 검색하거나 URL로 바로 재생합니다.")
-    @app_commands.describe(query="곡 이름으로 검색하거나 URL로 바로 재생해보세요.")
-    async def play(self, interaction: Interaction, query: str):
-        """Play a song by URL or search query."""
-        await interaction.response.defer()
-
-        try:
-            if not await self.validate_voice_state(interaction):
-                return
-
-            player = self.get_player(interaction.guild, interaction.channel)
-
-            # Connect to voice
-            if not await self.handle_voice_connection(interaction, player):
-                return
-
-            if is_url(query):
-                await self.handle_url_play(interaction, player, query)
-            else:
-                await self.handle_search_play(interaction, player, query)
-
-        except Exception as e:
-            logger.exception(f"Play command error: {e}")
-            await interaction.followup.send("재생 중 오류가 발생했습니다.", ephemeral=True)
-
-    async def validate_voice_state(self, interaction: Interaction) -> bool:
-        """Validate user's voice state."""
-        if not interaction.user.voice:
-            await interaction.followup.send("먼저 음성 채널에 접속해주세요.", ephemeral=True)
-            return False
-
-        voice_channel = interaction.user.voice.channel
-        if (interaction.guild.voice_client and
-            interaction.guild.voice_client.channel != voice_channel and
-            len(interaction.guild.voice_client.channel.members) > 1):
-            await interaction.followup.send(
-                "다른 음성 채널에서 이미 음악이 재생 중입니다.",
+            await interaction.response.send_message(
+                f"🗑️ **{removed_song.title}**를 대기열에서 제거했습니다.",
                 ephemeral=True
             )
-            return False
-
-        return True
-
-    async def handle_voice_connection(self, interaction: Interaction, player: MusicPlayer) -> bool:
-        """Handle voice client connection."""
-        try:
-            voice_channel = interaction.user.voice.channel
-            if not await player.connect_to_voice(voice_channel):
-                await interaction.followup.send("음성 채널 연결에 실패했습니다.", ephemeral=True)
-                return False
-            return True
         except Exception as e:
-            logger.error(f"Voice connection error: {e}")
-            await interaction.followup.send("음성 채널 연결에 실패했습니다.", ephemeral=True)
-            return False
+            logger.error(f"Error in remove command: {e}")
+            await interaction.response.send_message("노래 제거 중 오류가 발생했습니다.", ephemeral=True)
 
-    async def handle_url_play(self, interaction: Interaction, player: MusicPlayer, url: str):
-        """Handle playing from URL."""
-        try:
-            status_msg = await interaction.followup.send(
-                "🔄 곡을 다운로드하고 있습니다...",
-                ephemeral=True
-            )
+    @music_group.command(name="이동", description="대기열에서 노래의 순서를 변경합니다")
+    async def move(self, interaction: discord.Interaction, from_pos: int, to_pos: int):
+        queue = self.get_queue(interaction.guild.id)
 
-            logger.debug(f"Downloading song from URL: {url}")
-            source, song_id = await YTDLSource.from_url(
-                url, download=True,
-                loop=self.bot.loop,
-                music_dir=player.music_dir,
-                cache_manager=self.cache_manager
-            )
+        if not 1 <= from_pos <= len(queue.queue) or not 1 <= to_pos <= len(queue.queue):
+            await interaction.response.send_message("올바른 대기열 번호를 입력해주세요.", ephemeral=True)
+            return
 
-            logger.debug(f"Adding song to queue: {song_id}")
-            await player.add_to_queue(source.data, song_id)
+        song = queue.queue.pop(from_pos - 1)
+        queue.queue.insert(to_pos - 1, song)
 
-            # Wait for download
-            song_entry = await self.cache_manager.get(song_id)
-            if song_entry and song_entry.is_downloading:
-                try:
-                    await asyncio.wait_for(song_entry.download_future, timeout=30)
-                except asyncio.TimeoutError:
-                    await status_msg.edit(content="다운로드 시간이 초과되었습니다.")
-                    return
-
-            # Start playback if not playing
-            if not player.voice_client.is_playing():
-                logger.debug("Starting playback")
-                if not await player.play_next():
-                    await status_msg.edit(content="재생을 시작할 수 없습니다.")
-                    return
-
-            # Show success message
-            await status_msg.delete()
-            message = await interaction.followup.send(
-                f"🎵 추가됨: {source.title}",
-                ephemeral=False
-            )
-
-            # Delete success message after delay
-            await self.delete_message_after_delay(message)
-
-        except Exception as e:
-            logger.exception(f"Error processing URL: {e}")
-            await interaction.followup.send(
-                "URL 처리 중 오류가 발생했습니다.",
-                ephemeral=True
-            )
-
-    async def handle_search_play(self, interaction: Interaction, player: MusicPlayer, query: str):
-        """Handle search and play."""
-        try:
-            status_msg = await interaction.followup.send(
-                "🔍 검색 중...",
-                ephemeral=True
-            )
-
-            # Search for songs
-            search_results = await self.search_songs(query)
-            if not search_results:
-                await status_msg.edit(content="검색 결과가 없습니다.")
-                return
-
-            # Delete status message
-            await status_msg.delete()
-
-            # Create and send search results
-            embed = self.create_search_results_embed(search_results)
-            view = SearchResultsView(self, interaction, search_results)
-            message = await interaction.followup.send(
-                embed=embed,
-                view=view,
-                ephemeral=True
-            )
-            view.set_message(message)
-
-        except Exception as e:
-            logger.exception(f"Search error: {e}")
-            await interaction.followup.send(
-                "검색 중 오류가 발생했습니다.",
-                ephemeral=True
-            )
-
-    async def search_songs(self, query: str) -> List[Dict]:
-        """Search for songs with timeout."""
-        search_options = ytdlp_format_options.copy()
-        search_options.update({
-            'default_search': 'ytsearch5',
-            'extract_flat': True,
-            'force_generic_extractor': True
-        })
-
-        try:
-            info = await asyncio.wait_for(
-                self.bot.loop.run_in_executor(
-                    download_executor,
-                    lambda: yt_dlp.YoutubeDL(search_options).extract_info(
-                        f"ytsearch5:{query}", download=False
-                    )
-                ),
-                timeout=10
-            )
-
-            if not info.get('entries'):
-                return []
-
-            return [
-                {**entry, 'url': f"https://www.youtube.com/watch?v={entry['id']}"}
-                for entry in info['entries'][:5]
-                if entry and isinstance(entry, dict)
-            ]
-
-        except asyncio.TimeoutError:
-            logger.error("Search timeout")
-            return []
-        except Exception as e:
-            logger.error(f"Search error: {e}")
-            return []
-
-    def create_search_results_embed(self, results: List[Dict]) -> discord.Embed:
-        """Create enhanced search results embed."""
-        embed = discord.Embed(
-            title="🔍 검색 결과",
-            description="아래 번호를 클릭하여 곡을 선택하세요.",
-            color=discord.Color.blue()
+        await interaction.response.send_message(
+            f"🔄 **{song.title}**를 {from_pos}번에서 {to_pos}번으로 이동했습니다.",
+            ephemeral=True
         )
 
-        for idx, result in enumerate(results, 1):
-            title = result.get('title', 'Unknown Title')[:100]
-            duration = format_duration(result.get('duration', 0))
-            views = result.get('view_count', 0)
-            views_str = f"{views:,}" if views else "정보 없음"
+        if from_pos == 1 or to_pos == 1:
+            queue.preloaded_song = None
+            await self.preload_next_song(interaction.guild.id)
 
-            channel = result.get('channel', 'Unknown Channel')
-            upload_date = result.get('upload_date', '')
-            if upload_date:
-                upload_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState,
+                                    after: discord.VoiceState):
+        if not member.guild.voice_client:
+            return
 
-            embed.add_field(
-                name=f"{idx}. {title}",
-                value=f"⏱️ {duration} | 👁️ {views_str}\n📺 {channel}\n📅 {upload_date}",
-                inline=False
-            )
+        if len(member.guild.voice_client.channel.members) == 1:  # Only bot remains
+            try:
+                await self.cleanup_files(member.guild.id)
+                await member.guild.voice_client.disconnect()
+            except Exception as e:
+                logger.error(f"Error in voice state update: {e}")
 
-        embed.set_footer(text="60초 후에 자동으로 만료됩니다.")
+    @music_group.command(name="반복", description="반복 모드를 설정합니다 (없음/한곡/전체)")
+    async def loop(self, interaction: discord.Interaction):
+        queue = self.get_queue(interaction.guild.id)
+        mode = queue.toggle_loop_mode()
+        modes = {'none': '없음', 'song': '한곡', 'queue': '전체'}
+        await interaction.response.send_message(f"🔁 반복 모드를 '{modes[mode]}'으로 설정했습니다.", ephemeral=True)
 
-        # Add random tip
-        tips = [
-            "💡 URL을 직접 입력하여 재생할 수도 있습니다.",
-            "💡 재생 중 '볼륨' 명령어로 소리 크기를 조절할 수 있습니다.",
-            "💡 '반복' 명령어로 현재 곡을 반복 재생할 수 있습니다.",
-            "💡 '셔플' 명령어로 대기열을 무작위로 섞을 수 있습니다."
-        ]
-        embed.add_field(name="팁", value=random.choice(tips), inline=False)
+    @music_group.command(name="셔플", description="대기열의 노래를 무작위로 섞습니다")
+    async def shuffle(self, interaction: discord.Interaction):
+        queue = self.get_queue(interaction.guild.id)
+        if len(queue.queue) < 2:
+            await interaction.response.send_message("셔플할 노래가 충분하지 않습니다.", ephemeral=True)
+            return
+        queue.shuffle()
+        await interaction.response.send_message("🔀 대기열을 섞었습니다.", ephemeral=True)
 
-        return embed
+    async def periodic_cache_cleanup(self):
+        while not self.bot.is_closed():
+            try:
+                self.song_cache.cleanup()
+                await asyncio.sleep(300)  # Run every 5 minutes
+            except Exception as e:
+                logger.error(f"Error in cache cleanup: {e}")
+                await asyncio.sleep(60)
 
-    async def delete_message_after_delay(self, message: discord.Message, delay: int = 3):
-        """Delete a message after a delay."""
-        try:
-            await asyncio.sleep(delay)
-            await message.delete()
-        except (discord.NotFound, discord.HTTPException):
-            pass
+# =============================================================================
+# Setup Function
+# =============================================================================
 
-    # Add these commands to the MusicCog class
-
-    @song.command(name="정지", description="재생을 멈추고 대기열을 비웁니다.")
-    async def stop(self, interaction: Interaction):
-        try:
-            if not interaction.user.voice:
-                await interaction.response.send_message("먼저 음성 채널에 접속해주세요.", ephemeral=True)
-                return
-
-            player = self.get_player(interaction.guild, interaction.channel)
-
-            # Reset player states before cleanup
-            player.loop = False
-
-            # Reset button states if control view exists
-            if player.control_view:
-                for child in player.control_view.children:
-                    if child.custom_id == "loop":
-                        child.style = discord.ButtonStyle.secondary
-                        child.label = "🔄"
-                    elif child.custom_id == "pause":
-                        child.style = discord.ButtonStyle.secondary
-                        child.label = "⏸️"
-
-            await player.cleanup()
-            self.players.pop(interaction.guild.id, None)
-            await interaction.response.send_message("재생을 멈추고 대기열을 비웠습니다.", ephemeral=True)
-            logger.debug("정지 명령어 실행 완료")
-        except Exception as e:
-            logger.exception(f"정지 명령어 오류: {e}")
-            await handle_command_error(interaction, e, "정지 명령어 오류")
-
-    @song.command(name="스킵", description="현재 곡을 건너뜁니다.")
-    async def skip(self, interaction: Interaction):
-        try:
-            if not interaction.user.voice:
-                await interaction.response.send_message("먼저 음성 채널에 접속해주세요.", ephemeral=True)
-                return
-
-            player = self.get_player(interaction.guild, interaction.channel)
-            if not player.voice_client or not player.voice_client.is_playing():
-                await interaction.response.send_message("현재 재생 중인 곡이 없습니다.", ephemeral=True)
-                return
-
-            player.voice_client.stop()
-            await interaction.response.send_message("현재 곡을 건너뜁니다.", ephemeral=True)
-            logger.debug("스킵 명령어 실행")
-        except Exception as e:
-            logger.exception(f"스킵 명령어 오류: {e}")
-            await handle_command_error(interaction, e, "스킵 명령어 오류")
-
-    @song.command(name="대기열", description="현재 대기열을 보여줍니다.")
-    async def queue(self, interaction: Interaction):
-        try:
-            player = self.get_player(interaction.guild, interaction.channel)
-            if not player.queue and not player.current:
-                await interaction.response.send_message("대기열이 비어있습니다.", ephemeral=True)
-                return
-
-            embed = discord.Embed(title="🎵 재생 대기열", color=discord.Color.blue())
-
-            if player.current:
-                duration = format_duration(player.current.get('duration', 0))
-                embed.add_field(
-                    name="현재 재생 중",
-                    value=f"**{player.current['title']}**\n⏱️ {duration}",
-                    inline=False
-                )
-
-            for idx, song_id in enumerate(player.queue, 1):
-                song_entry = await self.cache_manager.get(song_id)
-                if song_entry:
-                    duration = format_duration(song_entry.duration)
-                    embed.add_field(
-                        name=f"{idx}번 곡",
-                        value=f"**{song_entry.title}**\n⏱️ {duration}",
-                        inline=False
-                    )
-
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            logger.debug("대기열 명령어 실행")
-        except Exception as e:
-            logger.exception(f"대기열 명령어 오류: {e}")
-            await handle_command_error(interaction, e, "대기열 명령어 오류")
-
-    @song.command(name="셔플", description="대기열의 곡 순서를 무작위로 섞습니다.")
-    async def shuffle(self, interaction: Interaction):
-        try:
-            if not interaction.user.voice:
-                await interaction.response.send_message("먼저 음성 채널에 접속해주세요.", ephemeral=True)
-                return
-
-            player = self.get_player(interaction.guild, interaction.channel)
-            if not player.queue:
-                await interaction.response.send_message("대기열이 비어있습니다.", ephemeral=True)
-                return
-
-            random.shuffle(player.queue)
-            await interaction.response.send_message("대기열을 섞었습니다.", ephemeral=True)
-            await player.update_now_playing()
-            logger.debug("셔플 명령어 실행")
-        except Exception as e:
-            logger.exception(f"셔플 명령어 오류: {e}")
-            await handle_command_error(interaction, e, "셔플 명령어 오류")
-
-    @song.command(name="볼륨", description="재생 볼륨을 조절합니다. (1-200)")
-    async def volume(self, interaction: Interaction, level: app_commands.Range[int, 1, 200]):
-        try:
-            if not interaction.user.voice:
-                await interaction.response.send_message("먼저 음성 채널에 접속해주세요.", ephemeral=True)
-                return
-
-            player = self.get_player(interaction.guild, interaction.channel)
-            if not player.voice_client or not player.voice_client.source:
-                await interaction.response.send_message("현재 재생 중인 곡이 없습니다.", ephemeral=True)
-                return
-
-            volume = level / 100
-            player.voice_client.source.volume = volume
-            await player.set_volume(volume)  # Save volume
-            await interaction.response.send_message(f"볼륨을 {level}%로 설정했습니다.", ephemeral=True)
-            await player.update_now_playing()
-            logger.debug(f"볼륨 조절: {level}%")
-        except Exception as e:
-            logger.exception(f"볼륨 명령어 오류: {e}")
-            await handle_command_error(interaction, e, "볼륨 명령어 오류")
-
-    @song.command(name="반복", description="현재 곡 반복을 설정/해제합니다.")
-    async def toggle_loop(self, interaction: Interaction):
-        try:
-            if not interaction.user.voice:
-                await interaction.response.send_message("먼저 음성 채널에 접속해주세요.", ephemeral=True)
-                return
-
-            player = self.get_player(interaction.guild, interaction.channel)
-            if not player.current and not player.queue:
-                await interaction.response.send_message("재생 중인 곡이 없어 반복 모드를 설정할 수 없습니다.", ephemeral=True)
-                return
-
-            player.loop = not player.loop
-            status = "활성화" if player.loop else "비활성화"
-            await interaction.response.send_message(f"반복 모드를 {status}했습니다.", ephemeral=True)
-            await player.update_now_playing()
-            logger.debug(f"반복 모드 {status}")
-        except Exception as e:
-            logger.exception(f"반복 모드 명령어 오류: {e}")
-            await handle_command_error(interaction, e, "반복 모드 명령어 오류")
-
-async def setup(bot: commands.Bot, reloaded: bool = False):
+async def setup(bot: commands.Bot):
+    """Setup function to add the cog to the bot"""
     await bot.add_cog(MusicCog(bot))
-    logger.info("MusicCog loaded successfully.")

@@ -157,7 +157,7 @@ class NewsCog(commands.Cog):
                     embed = Embed(
                         title=article.get("title", "제목 없음"),
                         description=f"{article.get('description', '요약 없음')[:200]}...\n\n[기사 읽기]({article.get('url', '')})",
-                        color=discord.Color.green()
+                        color=int('f9e54b', 16)
                     )
                     if article.get("urlToImage"):
                         embed.set_image(url=article["urlToImage"])
@@ -234,7 +234,7 @@ class NewsCog(commands.Cog):
         embed = Embed(
             title=article.get("title", "제목 없음"),
             description=f"{article.get('description', '요약 없음')[:200]}...\n\n[기사 읽기]({article.get('url', '')})",
-            color=discord.Color.green()
+            color=int('f9e54b', 16)
         )
         if article.get("urlToImage"):
             embed.set_image(url=article["urlToImage"])
@@ -331,7 +331,7 @@ class NewsCog(commands.Cog):
             logger.info(f"[Guild: {guild_id}] 뉴스 전송 채널 조회: 없음.")
             return
 
-        embed = Embed(title="등록된 뉴스 전송 채널", color=discord.Color.green())
+        embed = Embed(title="등록된 뉴스 전송 채널", color=int('f9e54b', 16))
         for channel_id, info in channels_data.items():
             channel = self.bot.get_channel(int(channel_id))
             channel_name = channel.mention if channel else f"채널 ID: {channel_id}"

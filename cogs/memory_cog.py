@@ -142,7 +142,7 @@ class MemoryCog(commands.Cog):
 
             content = memory.get("content", "내용 없음")
             image = memory.get("image", None)
-            embed = discord.Embed(title=name, description=content, color=discord.Color.green())
+            embed = discord.Embed(title=name, description=content, color=int('f9e54b', 16))
 
             if image:
                 if os.path.exists(image):
@@ -226,7 +226,7 @@ class MemoryCog(commands.Cog):
                 logger.info(f"[Guild: {guild_id}] 기억된 내용 없음.")
                 return
 
-            embed = discord.Embed(title="기억된 내용 리스트", description="저장된 기억들의 목록입니다.", color=discord.Color.green())
+            embed = discord.Embed(title="기억된 내용 리스트", description="저장된 기억들의 목록입니다.", color=int('f9e54b', 16))
             for name, content in memories.items():
                 text_content = content.get("content", "내용 없음")
                 image_url = content.get("image")
@@ -248,7 +248,7 @@ class MemoryCog(commands.Cog):
             guild_id = str(interaction.guild_id)
             logger.info(f"[Guild: {guild_id}] 프로필 명령어 실행: user='{user.display_name}'")
 
-            embed = discord.Embed(title=f"{user.display_name}의 프로필", color=discord.Color.green())
+            embed = discord.Embed(title=f"{user.display_name}의 프로필", color=int('f9e54b', 16))
             avatar_url = user.avatar.url if user.avatar else user.default_avatar.url
             embed.set_image(url=avatar_url)
             await interaction.followup.send(embed=embed)  # ephemeral=True 제거

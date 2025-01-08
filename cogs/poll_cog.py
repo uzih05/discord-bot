@@ -233,7 +233,7 @@ class PollView(View):
         else:
             title = self.title
             footer_text = f"종료 시각: {end_time_str}"
-            color = discord.Color.green()
+            color = color=int('f9e54b', 16)
 
         embed = Embed(title=title, color=color)
         total_votes = sum(self.votes.values())
